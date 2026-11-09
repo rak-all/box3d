@@ -778,6 +778,9 @@ static void b3CollideTask( int startIndex, int endIndex, int workerIndex, void* 
 
 		if ( touching )
 		{
+			// b3unity patch: the anchors of a rolling shape sit on its axis, not on the contact point (see b3IsRollingShape in contact.c),
+			// so the recycled separation is measured from where the anchors are now (zero for every other contact: both anchors are the point)
+			b3Vec3 dc0 = b3SubPos( bodySimB->center, bodySimA->center );
 			int manifoldCount = contact->manifoldCount;
 			for ( int manifoldIndex = 0; manifoldIndex < manifoldCount; ++manifoldIndex )
 			{
@@ -787,7 +790,8 @@ static void b3CollideTask( int startIndex, int endIndex, int workerIndex, void* 
 				{
 					// Cache separation
 					b3ManifoldPoint* mp = manifold->points + pointIndex;
-					mp->baseSeparation = mp->separation;
+					mp->baseSeparation =
+						mp->separation - b3Dot( b3Add( dc0, b3Sub( mp->anchorB, mp->anchorA ) ), manifold->normal );
 				}
 			}
 		}
