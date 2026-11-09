@@ -778,7 +778,7 @@ static void b3CollideTask( int startIndex, int endIndex, int workerIndex, void* 
 
 		if ( touching )
 		{
-			// b3unity patch: the anchors of a rolling shape sit on its axis, not on the contact point (see b3IsRollingShape in contact.c),
+			// BlockSandbox fork: the anchors of a rolling shape sit on its axis, not on the contact point (see b3IsRollingShape in contact.c),
 			// so the recycled separation is measured from where the anchors are now (zero for every other contact: both anchors are the point)
 			b3Vec3 dc0 = b3SubPos( bodySimB->center, bodySimA->center );
 			int manifoldCount = contact->manifoldCount;

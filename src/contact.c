@@ -733,7 +733,7 @@ static bool b3UpdateConvexContact( b3World* world, int workerIndex, b3Contact* c
 
 // Update the contact manifold and touching status.
 // Note: do not assume the shape AABBs are overlapping or are valid.
-// b3unity patch (ThirdParty/b3unity/box3d-rolling-anchor.patch): a frictionless sphere or capsule marked with this user material id
+// BlockSandbox fork (github.com/rak-all/box3d, branch blocksandbox): a frictionless sphere or capsule marked with this user material id
 // measures its contacts from its axis instead of from its surface. The solver turns each anchor with the body inside the step to track
 // the separation; for a fast spinning wheel the surface point swings up and away (0.48 rad per substep at 115 rad/s) and the solver
 // thinks the wheel is leaving the ground, so it sinks in. The axis point is on the same line of action (the normal of a round shape
@@ -898,7 +898,7 @@ bool b3UpdateContact( b3World* world, int workerIndex, b3Contact* contact, b3Sha
 		b3Vec3 centerA = b3RotateVector( xfA.q, localCenterA );
 		b3Vec3 centerB = b3RotateVector( xfB.q, localCenterB );
 
-		// b3unity patch: rolling shapes are measured from their axis (see b3IsRollingShape)
+		// BlockSandbox fork: rolling shapes are measured from their axis (see b3IsRollingShape)
 		bool rollingA = b3IsRollingShape( shapeA ), rollingB = b3IsRollingShape( shapeB );
 		if ( rollingA || rollingB )
 		{
