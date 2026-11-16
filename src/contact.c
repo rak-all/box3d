@@ -750,6 +750,116 @@ static bool b3IsRollingShape( const b3Shape* shape )
 	return m->userMaterialId == B3U_ROLLING_MATERIAL && m->friction == 0.0f;
 }
 
+// BlockSandbox fork: a wheel's two shapes against the static world. A wheel is the round frictionless capsule above (its tread) and a
+// faceted disc (a hull) marked with this user material id, the body-local axle axis in the low 2 bits (0 x, 1 y, 2 z). The capsule's round
+// ends reach a whole wheel radius past the tyre's sides, so a wheel rubbing a wall was held off it by tens of centimetres; the disc's rim
+// is faceted, so rolling on it bumps. Against a static body each contact is taken by one of them by its normal: across the axle (the
+// tread, also with the body leaning up to 30 degrees) the capsule, along it (the wheel's side) the disc. Against moving bodies, and for
+// a wheel not marked so (one that broke off), every contact counts as usual.
+#define B3U_WHEEL_SIDE_MATERIAL 0x5748454C53494400ull
+
+static bool b3IsWheelSide( const b3Shape* shape )
+{
+	return shape->type == b3_hullShape && ( b3GetShapeMaterials( shape )->userMaterialId & ~3ull ) == B3U_WHEEL_SIDE_MATERIAL;
+}
+
+// how much the contact normal runs along the wheel's axle (0 across it, 1 along it); -1 if the shape is no wheel part
+static float b3WheelAxleShare( const b3Shape* shape, b3Quat q, b3Vec3 normal, bool rolling )
+{
+	b3Vec3 axle;
+	if ( rolling && shape->type == b3_capsuleShape )
+	{
+		axle = b3Sub( shape->capsule.center2, shape->capsule.center1 );
+		if ( b3Dot( axle, axle ) < 1e-12f )
+		{
+			return -1.0f;
+		}
+	}
+	else if ( b3IsWheelSide( shape ) )
+	{
+		int axis = (int)( b3GetShapeMaterials( shape )->userMaterialId & 3ull );
+		axle = (b3Vec3){ axis == 0 ? 1.0f : 0.0f, axis == 1 ? 1.0f : 0.0f, axis == 2 ? 1.0f : 0.0f };
+	}
+	else
+	{
+		return -1.0f;
+	}
+	return b3AbsFloat( b3Dot( b3Normalize( b3RotateVector( q, axle ) ), normal ) );
+}
+
+static bool b3IsRollingShape( const b3Shape* shape );
+
+// Drop the manifolds of a wheel shape against a static body that the other wheel shape takes (see above). False if none is left.
+static bool b3FilterWheelContact( b3World* world, b3Contact* contact, b3Shape* shapeA, b3WorldTransform xfA, b3Shape* shapeB,
+								  b3WorldTransform xfB )
+{
+	bool rollingA = b3IsRollingShape( shapeA ), rollingB = b3IsRollingShape( shapeB );
+	bool sideA = b3IsWheelSide( shapeA ), sideB = b3IsWheelSide( shapeB );
+	if ( !rollingA && !rollingB && !sideA && !sideB )
+	{
+		return true;
+	}
+	b3Body* bodyA = b3Array_Get( world->bodies, shapeA->bodyId );
+	b3Body* bodyB = b3Array_Get( world->bodies, shapeB->bodyId );
+	// the wheel part and the static body it meets
+	const b3Shape* wheel;
+	b3Quat q;
+	bool rolling;
+	if ( ( rollingA || sideA ) && bodyB->type == b3_staticBody )
+	{
+		wheel = shapeA; q = xfA.q; rolling = rollingA;
+	}
+	else if ( ( rollingB || sideB ) && bodyA->type == b3_staticBody )
+	{
+		wheel = shapeB; q = xfB.q; rolling = rollingB;
+	}
+	else
+	{
+		return true;
+	}
+
+	int kept = 0;
+	bool keep[16];
+	int count = contact->manifoldCount < 16 ? contact->manifoldCount : 16;
+	for ( int i = 0; i < count; ++i )
+	{
+		float share = b3WheelAxleShare( wheel, q, contact->manifolds[i].normal, rolling );
+		keep[i] = share < 0.0f || ( rolling ? share < 0.5f : share >= 0.5f );
+		kept += keep[i] ? 1 : 0;
+	}
+	for ( int i = count; i < contact->manifoldCount; ++i )
+	{
+		kept += 1;
+	}
+	if ( kept == contact->manifoldCount )
+	{
+		return true;
+	}
+	if ( kept == 0 )
+	{
+		b3FreeManifolds( world, contact->manifolds, contact->manifoldCount );
+		contact->manifolds = NULL;
+		contact->manifoldCount = 0;
+		contact->flags &= ~b3_relativeTransformValid;
+		return false;
+	}
+	// the manifolds come from pools by their count: a smaller set is a new array
+	b3Manifold* fewer = b3AllocateManifolds( world, kept );
+	int k = 0;
+	for ( int i = 0; i < contact->manifoldCount; ++i )
+	{
+		if ( i >= count || keep[i] )
+		{
+			fewer[k++] = contact->manifolds[i];
+		}
+	}
+	b3FreeManifolds( world, contact->manifolds, contact->manifoldCount );
+	contact->manifolds = fewer;
+	contact->manifoldCount = kept;
+	contact->flags &= ~b3_relativeTransformValid;
+	return true;
+}
+
 // anchor relative to the body origin, world orientation -> the closest point on the shape's axis (same frame)
 static b3Vec3 b3RollingAnchor( const b3Shape* shape, b3Quat q, b3Vec3 anchor )
 {
@@ -891,6 +1001,12 @@ bool b3UpdateContact( b3World* world, int workerIndex, b3Contact* contact, b3Sha
 		// Convex-vs-convex
 		bool flip = false;
 		touching = b3UpdateConvexContact( world, workerIndex, contact, shapeA, xfA, shapeB, xfB, flip, arena );
+	}
+
+	// BlockSandbox fork: a wheel meets the static world with its tread (the capsule) and its sides (the disc) only, see b3FilterWheelContact
+	if ( touching )
+	{
+		touching = b3FilterWheelContact( world, contact, shapeA, xfA, shapeB, xfB );
 	}
 
 	if ( touching )
