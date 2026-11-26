@@ -49,6 +49,7 @@ set(BOX3D_SOURCE_FILES
 	math_internal.h
 	mesh_contact.c
 	mesh.c
+	motion_lock_joint.c
 	motor_joint.c
 	mover.c
 	mover_joint.c
@@ -92,6 +93,7 @@ set(BOX3D_SOURCE_FILES
 	table.c
 	table.h
 	timer.c
+	tire_joint.c
 	triangle_manifold.c
 	types.c
 	verstable.h

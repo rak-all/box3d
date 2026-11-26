@@ -126,6 +126,7 @@ void SampleContext::Save()
 	fprintf( file, "  \"drawDistance\": %g,\n", drawDistance );
 	fprintf( file, "  \"showHullEdges\": %s,\n", GetEdgeOverlayParams().showHulls ? "true" : "false" );
 	fprintf( file, "  \"showEdgeConvexity\": %s,\n", GetEdgeOverlayParams().showEdgeConvexity ? "true" : "false" );
+	fprintf( file, "  \"edgeAlpha\": %g,\n", GetEdgeOverlayParams().alphaScale );
 	fprintf( file, "  \"showMetrics\": %s,\n", showMetrics ? "true" : "false" );
 	fprintf( file, "  \"showProfile\": %s,\n", showProfile ? "true" : "false" );
 	fprintf( file, "  \"replayKeyframeBudgetMB\": %d,\n", replayKeyframeBudgetMB );
@@ -274,6 +275,12 @@ void SampleContext::Load()
 			p.showEdgeConvexity = strncmp( s, "true", 4 ) == 0;
 			SetEdgeOverlayParams( &p );
 		}
+		else if ( jsoneq( data, &tokens[i], "edgeAlpha" ) == 0 )
+		{
+			EdgeOverlayParams p = GetEdgeOverlayParams();
+			p.alphaScale = b3ClampFloat( ParseFloat( data, tokens[i + 1] ), 0.0f, 4.0f );
+			SetEdgeOverlayParams( &p );
+		}
 		else if ( jsoneq( data, &tokens[i], "showMetrics" ) == 0 )
 		{
 			const char* s = data + tokens[i + 1].start;
@@ -309,6 +316,7 @@ Sample::Sample( SampleContext* context )
 	}
 
 	m_worldId = b3_nullWorldId;
+	m_lockGroundId = b3_nullBodyId;
 
 	m_recording = nullptr;
 	m_recordStartStep = 0;
@@ -404,6 +412,7 @@ void Sample::CreateWorld( b3Capacity* capacity )
 	m_mouseBodyId = {};
 	m_mouseJointId = {};
 	m_mousePoint = {};
+	m_lockGroundId = b3_nullBodyId;
 
 	b3WorldDef worldDef = b3DefaultWorldDef();
 	worldDef.workerCount = m_context->workerCount;
@@ -624,6 +633,66 @@ b3BodyId Sample::AddGroundBox( float extent )
 	SetGroundShape( shapeId );
 
 	return groundId;
+}
+
+b3JointId CreateMotionLock( b3BodyId groundId, b3BodyId bodyId, MotionLockFlags flags )
+{
+	// Fixed rotation is a zero inverse inertia on the body, not a constraint
+	b3Body_SetFixedRotation( bodyId, flags.rotation == e_fixedRotation );
+
+	b3MotionLockJointDef jointDef = b3DefaultMotionLockJointDef();
+	jointDef.lockLinearX = flags.linearX;
+	jointDef.lockLinearY = flags.linearY;
+	jointDef.lockLinearZ = flags.linearZ;
+
+	// The joint locks rotation to the z axis of its frame, so aim that axis along the free world axis and
+	// carry the linear locks along to the frame axes that land on each world axis.
+	b3Quat frameQ = b3Quat_identity;
+	if ( flags.rotation == e_spinX || flags.rotation == e_spinY || flags.rotation == e_spinZ )
+	{
+		jointDef.lockAngularXY = true;
+
+		if ( flags.rotation == e_spinX )
+		{
+			frameQ = b3MakeQuatFromAxisAngle( b3Vec3_axisY, 0.5f * B3_PI );
+			jointDef.lockLinearX = flags.linearZ;
+			jointDef.lockLinearZ = flags.linearX;
+		}
+		else if ( flags.rotation == e_spinY )
+		{
+			frameQ = b3MakeQuatFromAxisAngle( b3Vec3_axisX, -0.5f * B3_PI );
+			jointDef.lockLinearY = flags.linearZ;
+			jointDef.lockLinearZ = flags.linearY;
+		}
+	}
+
+	if ( jointDef.lockLinearX == false && jointDef.lockLinearY == false && jointDef.lockLinearZ == false &&
+		 jointDef.lockAngularXY == false )
+	{
+		return b3_nullJointId;
+	}
+
+	jointDef.base.bodyIdA = groundId;
+	jointDef.base.bodyIdB = bodyId;
+	jointDef.base.localFrameA.q = b3InvMulQuat( b3Body_GetRotation( groundId ), frameQ );
+	jointDef.base.localFrameA.p = b3Body_GetLocalPoint( groundId, b3Body_GetWorldCenter( bodyId ) );
+	jointDef.base.localFrameB.q = b3InvMulQuat( b3Body_GetRotation( bodyId ), frameQ );
+	jointDef.base.localFrameB.p = b3Body_GetLocalCenter( bodyId );
+
+	b3WorldId worldId = b3Body_GetWorld( bodyId );
+	return b3CreateMotionLockJoint( worldId, &jointDef );
+}
+
+b3JointId Sample::LockMotion( b3BodyId bodyId, MotionLockFlags flags )
+{
+	if ( B3_IS_NULL( m_lockGroundId ) )
+	{
+		b3BodyDef bodyDef = b3DefaultBodyDef();
+		bodyDef.name = "lock ground";
+		m_lockGroundId = b3CreateBody( m_worldId, &bodyDef );
+	}
+
+	return CreateMotionLock( m_lockGroundId, bodyId, flags );
 }
 
 struct RowDef
@@ -1036,8 +1105,9 @@ void Sample::DrawMetrics()
 
 	if ( ImGui::BeginTabItem( "Counters" ) )
 	{
-		b3Counters s = b3World_GetCounters( m_worldId );
-		b3Capacity c = b3World_GetMaxCapacity( m_worldId );
+		b3WorldId worldId = GetMetricsWorldId();
+		b3Counters s = b3World_GetCounters( worldId );
+		b3Capacity c = b3World_GetMaxCapacity( worldId );
 
 		constexpr int colorCount = sizeof( s.colorCounts ) / sizeof( s.colorCounts[0] );
 		constexpr int overflowIndex = colorCount - 1;
@@ -1063,7 +1133,7 @@ void Sample::DrawMetrics()
 			ImGui::SetItemTooltip( "current / max" );
 			ImGui::Text( "joints   %d", s.jointCount );
 			ImGui::Text( "islands  %d", s.islandCount );
-			ImGui::Text( "tasks    %d", s.taskCount );
+			ImGui::Text( "tasks    %d / %d", s.enqueueCount, s.taskCount );
 
 			ImGui::TableNextColumn();
 			ImGui::Text( "static tree  %d", s.staticTreeHeight );
@@ -1080,9 +1150,8 @@ void Sample::DrawMetrics()
 			ImGui::Text( "toi %d / %d / %d", s.distanceIterations, s.pushBackIterations, s.rootIterations );
 			ImGui::SetItemTooltip( "TOI distance / push back / root iterations" );
 
-			// The world clamps into the second to last bucket, so the last is always empty and the
-			// second to last means that many or more
-			constexpr int manifoldBarCount = manifoldBucketCount - 1;
+			// One bucket per manifold count, up to the cap
+			constexpr int manifoldBarCount = manifoldBucketCount;
 			int totalManifolds = 0;
 			int maxManifolds = 0;
 			ImU32 manifoldColors[manifoldBarCount];
@@ -1099,8 +1168,7 @@ void Sample::DrawMetrics()
 				DrawBarChart( "##manifolds", s.manifoldCounts, manifoldColors, manifoldBarCount, maxManifolds, manifoldSize );
 			if ( hoveredBucket >= 0 )
 			{
-				const char* plus = hoveredBucket == manifoldBarCount - 1 ? "+" : "";
-				ImGui::SetTooltip( "%d%s manifolds: %d of %d pairs", hoveredBucket + 1, plus, s.manifoldCounts[hoveredBucket],
+				ImGui::SetTooltip( "%d manifolds: %d of %d pairs", hoveredBucket + 1, s.manifoldCounts[hoveredBucket],
 								   totalManifolds );
 			}
 
@@ -1376,8 +1444,52 @@ void Sample::DrawTextLine( const char* text, ... )
 	char buffer[512];
 	vsnprintf( buffer, sizeof( buffer ), text, args );
 	va_end( args );
-	DrawScreenString( m_textX, m_textLine, MakeColor( b3_colorWhite ), buffer );
-	m_textLine += m_textIncrement;
+
+	// The text arena keeps 63 characters per string, so wrap long lines at spaces and indent the rest
+	constexpr int capacity = 63;
+	constexpr int indent = 2;
+	const char* start = buffer;
+	bool first = true;
+	while ( true )
+	{
+		int width = first ? capacity : capacity - indent;
+		int length = (int)strlen( start );
+		int cut = length;
+		if ( length > width )
+		{
+			cut = width;
+			while ( cut > 0 && start[cut] != ' ' )
+			{
+				cut -= 1;
+			}
+
+			if ( cut == 0 )
+			{
+				cut = width;
+			}
+		}
+
+		char line[capacity + 1];
+		int offset = first ? 0 : indent;
+		memset( line, ' ', offset );
+		memcpy( line + offset, start, cut );
+		line[offset + cut] = '\0';
+		DrawScreenString( m_textX, m_textLine, MakeColor( b3_colorWhite ), line );
+		m_textLine += m_textIncrement;
+
+		start += cut;
+		while ( *start == ' ' )
+		{
+			start += 1;
+		}
+
+		if ( *start == '\0' )
+		{
+			break;
+		}
+
+		first = false;
+	}
 }
 
 SampleEntry g_sampleEntries[MAX_SAMPLES];
@@ -1712,6 +1824,11 @@ static void DrawRenderMenu( SampleContext& ctx )
 	ImGui::Separator();
 
 	ImGui::PushItemWidth( 8.0f * ImGui::GetFontSize() );
+	if ( ImGui::SliderFloat( "Edge Alpha", &edgeParams.alphaScale, 0.0f, 4.0f, "%.2f" ) )
+	{
+		SetEdgeOverlayParams( &edgeParams );
+	}
+
 	float ev = GetExposure();
 	if ( ImGui::SliderFloat( "Exposure", &ev, -8.0f, 4.0f, "%.2f" ) )
 	{

@@ -16,7 +16,8 @@
 
 void b3MoverJoint_SetLinearVelocity( b3JointId jointId, b3Vec3 velocity )
 {
-	B3_ASSERT( b3IsValidVec3( velocity ) );
+	B3_CHECK_INPUT( b3IsValidVec3( velocity ) );
+
 	b3World* world = b3GetWorld( jointId.world0 );
 	B3_REC( world, MoverJointSetLinearVelocity, jointId, velocity );
 	b3JointSim* joint = b3GetJointSimCheckType( jointId, b3_moverJoint );
@@ -31,7 +32,8 @@ b3Vec3 b3MoverJoint_GetLinearVelocity( b3JointId jointId )
 
 void b3MoverJoint_SetMaxVelocityForce( b3JointId jointId, float maxForce )
 {
-	B3_ASSERT( b3IsValidFloat( maxForce ) && maxForce >= 0.0f );
+	B3_CHECK_INPUT( b3IsValidFloat( maxForce ) && maxForce >= 0.0f );
+
 	b3World* world = b3GetWorld( jointId.world0 );
 	B3_REC( world, MoverJointSetMaxVelocityForce, jointId, maxForce );
 	b3JointSim* joint = b3GetJointSimCheckType( jointId, b3_moverJoint );
@@ -65,8 +67,8 @@ void b3PrepareMoverJoint( b3JointSim* base, b3StepContext* context )
 
 	B3_ASSERT( bodyA->setIndex == b3_awakeSet || bodyB->setIndex == b3_awakeSet );
 
-	b3SolverSet* setA = b3Array_Get( world->solverSets, bodyA->setIndex );
-	b3SolverSet* setB = b3Array_Get( world->solverSets, bodyB->setIndex );
+	b3SolverSet* setA = b3GetFixedSolverSet( world, bodyA->setIndex );
+	b3SolverSet* setB = b3GetFixedSolverSet( world, bodyB->setIndex );
 
 	int localIndexA = bodyA->localIndex;
 	int localIndexB = bodyB->localIndex;

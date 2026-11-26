@@ -2,13 +2,16 @@
 // SPDX-License-Identifier: MIT
 
 #include "gfx/draw.h"
+#include "gfx/keycodes.h"
 #include "imgui.h"
 #include "mesh_loader.h"
+#include "meshoptimizer.h"
 #include "sample.h"
 
 #include "box3d/box3d.h"
 
 #include <ctype.h>
+#include <float.h>
 #include <iterator>
 #include <stdio.h>
 #include <stdlib.h>
@@ -424,6 +427,128 @@ public:
 
 static int sampleHullCrash = RegisterSample( "Issues", "Hull Crash", HullCrash::Create );
 
+// Issue #225: hull of random points in a thin slab used to hang. Thin input may now fail and return null.
+class ThinSlabHull : public Sample
+{
+public:
+	explicit ThinSlabHull( SampleContext* context )
+		: Sample( context )
+	{
+		m_hull = nullptr;
+		m_pointSet = 0;
+		m_thickness = 0.05f;
+		m_maxVertexCount = 32;
+
+		CreateHull();
+
+		if ( m_context->restart == false )
+		{
+			m_camera->SetView( 0.0f, 15.0f, 20.0f, b3Pos_zero );
+		}
+	}
+
+	~ThinSlabHull() override
+	{
+		if ( m_hull != nullptr )
+		{
+			b3DestroyHull( m_hull );
+		}
+	}
+
+	static float SlabRandom( uint32_t* state )
+	{
+		*state = *state * 1664525u + 1013904223u;
+		return (float)( *state >> 8 ) / 16777216.0f;
+	}
+
+	void CreateHull()
+	{
+		if ( m_hull != nullptr )
+		{
+			b3DestroyHull( m_hull );
+			m_hull = nullptr;
+		}
+
+		// Point set zero is the one from the issue
+		uint32_t state = 12345u + (uint32_t)m_pointSet;
+		for ( int i = 0; i < m_pointCount; ++i )
+		{
+			m_points[i].x = SlabRandom( &state ) * 10.0f - 5.0f;
+			m_points[i].y = ( SlabRandom( &state ) - 0.5f ) * m_thickness;
+			m_points[i].z = SlabRandom( &state ) * 10.0f - 5.0f;
+		}
+
+		m_hull = b3CreateHull( m_points, m_pointCount, m_maxVertexCount );
+	}
+
+	bool DrawControls() override
+	{
+		if ( m_hull != nullptr )
+		{
+			DrawTextLine( "hull: vertices = %d, edges = %d, faces = %d", m_hull->vertexCount, m_hull->edgeCount / 2,
+						  m_hull->faceCount );
+		}
+		else
+		{
+			DrawTextLine( "hull creation failed" );
+		}
+
+		if ( ImGui::SliderInt( "Point Set", &m_pointSet, 0, 99 ) )
+		{
+			CreateHull();
+		}
+
+		float thicknessCm = 100.0f * m_thickness;
+		if ( ImGui::SliderFloat( "Thickness", &thicknessCm, 0.01f, 100.0f, "%.2f cm",
+								 ImGuiSliderFlags_Logarithmic | ImGuiSliderFlags_AlwaysClamp ) )
+		{
+			m_thickness = 0.01f * thicknessCm;
+			CreateHull();
+		}
+
+		if ( ImGui::SliderInt( "Max Vertices", &m_maxVertexCount, 4, B3_MAX_HULL_VERTICES ) )
+		{
+			CreateHull();
+		}
+
+		return true;
+	}
+
+	void Render() override
+	{
+		DrawGroundGrid( 20 );
+
+		if ( m_hull != nullptr )
+		{
+			DrawHull( b3WorldTransform_identity, m_hull, MakeColor( b3_colorYellow ) );
+		}
+
+		b3HexColor pointColor = m_hull != nullptr ? b3_colorWhite : b3_colorRed;
+		for ( int i = 0; i < m_pointCount; ++i )
+		{
+			DrawPoint( b3ToPos( m_points[i] ), 5.0f, MakeColor( pointColor ) );
+		}
+
+		DrawAxes( b3WorldTransform_identity, 1.0f );
+
+		Sample::Render();
+	}
+
+	static Sample* Create( SampleContext* sampleContext )
+	{
+		return new ThinSlabHull( sampleContext );
+	}
+
+	static constexpr int m_pointCount = 400;
+	b3Vec3 m_points[m_pointCount];
+	b3HullData* m_hull;
+	int m_pointSet;
+	float m_thickness;
+	int m_maxVertexCount;
+};
+
+static int sampleThinSlabHull = RegisterSample( "Issues", "Thin Slab Hull", ThinSlabHull::Create );
+
 class ConvexJitter : public Sample
 {
 public:
@@ -573,9 +698,7 @@ public:
 			b3BodyDef bodyDef = b3DefaultBodyDef();
 			bodyDef.type = b3_dynamicBody;
 			bodyDef.position = { 0.0f, 3.5f, 0.0f };
-			bodyDef.motionLocks.angularX = true;
-			bodyDef.motionLocks.angularY = true;
-			bodyDef.motionLocks.angularZ = true;
+			bodyDef.fixedRotation = true;
 			bodyDef.enableContactRecycling = false;
 			b3BodyId bodyId = b3CreateBody( m_worldId, &bodyDef );
 
@@ -649,9 +772,7 @@ public:
 			b3BodyDef bodyDef = b3DefaultBodyDef();
 			bodyDef.type = b3_dynamicBody;
 			bodyDef.position = { 0.0f, 4.0f, 10.0f };
-			bodyDef.motionLocks.angularX = true;
-			bodyDef.motionLocks.angularY = true;
-			bodyDef.motionLocks.angularZ = true;
+			bodyDef.fixedRotation = true;
 			bodyDef.enableSleep = false;
 			bodyDef.enableContactRecycling = false;
 			b3BodyId body = b3CreateBody( m_worldId, &bodyDef );
@@ -732,23 +853,27 @@ public:
 			m_camera->SetView( 90.0f, 25.0f, 10.0f, { 0.0f, 1.0f, 0.0f } );
 		}
 
-		// Two chunks meeting at x = 0, each its own body and mesh shape, so seam contacts live
-		// in separate contact pairs like s&box world mesh chunks. A beam top straddles the seam.
-		CreateFloorChunk( 0, -(float)m_halfLengthU, 0.0f );
-		CreateFloorChunk( 1, 0.0f, (float)m_halfLengthU );
+		m_fixWinding = true;
+		m_combineChunks = true;
+		m_remesh = true;
+		m_simplifyErrorMillimeters = 10.0f;
+		m_repeatSimplify = true;
+		CreateFloor();
 
 		// Character
 		{
 			b3BodyDef bodyDef = b3DefaultBodyDef();
 			bodyDef.type = b3_dynamicBody;
 			bodyDef.position = { -m_walkRangeX, m_bodyHalfHeight + 0.1f, 0.0f };
-			bodyDef.motionLocks.angularX = true;
-			bodyDef.motionLocks.angularY = true;
-			bodyDef.motionLocks.angularZ = true;
+			bodyDef.fixedRotation = true;
 			bodyDef.enableSleep = false;
-			bodyDef.enableContactRecycling = false;
+
+			// With current ghost mitigation this seems unnecessary
+			// bodyDef.enableContactRecycling = false;
+
 			bodyDef.gravityScale = 2.03f; // s&box gravity: 800 inch/s^2
 			bodyDef.name = "character";
+			bodyDef.safetyFactor = 0.05f;
 			m_characterId = b3CreateBody( m_worldId, &bodyDef );
 
 			b3ShapeDef shapeDef = b3DefaultShapeDef();
@@ -758,7 +883,9 @@ public:
 
 			float volume = 8.0f * m_bodyHalfWidth * m_bodyHalfHeight * m_bodyHalfWidth;
 			shapeDef.density = m_characterMass / volume;
-			shapeDef.enableSpeculativeContact = false;
+
+			// With current ghost mitigation this seems unnecessary
+			// shapeDef.enableSpeculativeContact = false;
 
 			b3BoxHull box = b3MakeBoxHull( m_bodyHalfWidth, m_bodyHalfHeight, m_bodyHalfWidth );
 			b3CreateHullShape( m_characterId, &shapeDef, &box.base );
@@ -778,8 +905,45 @@ public:
 
 	~SBoxGhostCollisions() override
 	{
-		b3DestroyMesh( m_chunkMesh[0] );
-		b3DestroyMesh( m_chunkMesh[1] );
+		for ( int i = 0; i < 2; ++i )
+		{
+			if ( m_chunkMesh[i] != nullptr )
+			{
+				b3DestroyMesh( m_chunkMesh[i] );
+			}
+		}
+	}
+
+	void CreateFloor()
+	{
+		m_chunkTriangleCount[1] = 0;
+		m_simplifyPassCount[1] = 0;
+
+		if ( m_combineChunks )
+		{
+			CreateFloorChunk( 0, -(float)m_halfLengthU, (float)m_halfLengthU );
+			return;
+		}
+
+		// Two chunks meeting at x = 0, each its own body and mesh shape, so seam contacts live
+		// in separate contact pairs like s&box world mesh chunks. A beam top straddles the seam.
+		CreateFloorChunk( 0, -(float)m_halfLengthU, 0.0f );
+		CreateFloorChunk( 1, 0.0f, (float)m_halfLengthU );
+	}
+
+	void DestroyFloor()
+	{
+		for ( int i = 0; i < 2; ++i )
+		{
+			if ( B3_IS_NON_NULL( m_chunkBodyIds[i] ) )
+			{
+				b3DestroyBody( m_chunkBodyIds[i] );
+				b3DestroyMesh( m_chunkMesh[i] );
+			}
+
+			m_chunkBodyIds[i] = b3_nullBodyId;
+			m_chunkMesh[i] = nullptr;
+		}
 	}
 
 	// Deterministic integer hash for tile tessellation selection
@@ -793,7 +957,8 @@ public:
 		return x;
 	}
 
-	static void EmitTriangle( std::vector<b3Vec3>& vertices, std::vector<int32_t>& indices, b3Vec3 a, b3Vec3 b, b3Vec3 c )
+	static void EmitTriangle( std::vector<b3Vec3>& vertices, std::vector<int32_t>& indices, b3Vec3 a, b3Vec3 b,
+							  b3Vec3 c )
 	{
 		int32_t base = (int32_t)vertices.size();
 		vertices.push_back( a );
@@ -805,8 +970,8 @@ public:
 	}
 
 	// Horizontal patch at height y spanning [x0,x1]x[z0,z1] (inches), normal +y
-	static void EmitPatch( std::vector<b3Vec3>& vertices, std::vector<int32_t>& indices, float x0, float x1, float z0, float z1,
-						   float y, float cell )
+	static void EmitPatch( std::vector<b3Vec3>& vertices, std::vector<int32_t>& indices, float x0, float x1, float z0,
+						   float z1, float y, float cell )
 	{
 		if ( x1 - x0 < 0.01f )
 		{
@@ -846,9 +1011,12 @@ public:
 	}
 
 	// Sloped strip from edge (xLow, yLow) to edge (xHigh, yHigh) spanning the full z width
-	static void EmitSlope( std::vector<b3Vec3>& vertices, std::vector<int32_t>& indices, float xLow, float yLow, float xHigh,
-						   float yHigh, float zCell )
+	static void EmitSlope( std::vector<b3Vec3>& vertices, std::vector<int32_t>& indices, float xLow, float yLow,
+						   float xHigh, float yHigh, float zCell, bool fixWinding )
 	{
+		// The original winding only faces out for a slope rising toward +x
+		bool flip = fixWinding && xHigh < xLow;
+
 		int countZ = (int)( 2.0f * (float)m_halfWidthU / zCell + 0.99f );
 		for ( int iz = 0; iz < countZ; ++iz )
 		{
@@ -860,15 +1028,26 @@ public:
 			b3Vec3 h0 = { SRC * xHigh, SRC * yHigh, SRC * z0 };
 			b3Vec3 h1 = { SRC * xHigh, SRC * yHigh, SRC * z1 };
 
-			EmitTriangle( vertices, indices, l0, l1, h1 );
-			EmitTriangle( vertices, indices, l0, h1, h0 );
+			if ( flip )
+			{
+				EmitTriangle( vertices, indices, l0, h1, l1 );
+				EmitTriangle( vertices, indices, l0, h0, h1 );
+			}
+			else
+			{
+				EmitTriangle( vertices, indices, l0, l1, h1 );
+				EmitTriangle( vertices, indices, l0, h1, h0 );
+			}
 		}
 	}
 
 	// Vertical wall at x from y0 (bottom) to y1 (top). facing = +1 faces +x, -1 faces -x
-	static void EmitWall( std::vector<b3Vec3>& vertices, std::vector<int32_t>& indices, float x, float y0, float y1, int facing,
-						  float zCell )
+	static void EmitWall( std::vector<b3Vec3>& vertices, std::vector<int32_t>& indices, float x, float y0, float y1,
+						  int facing, float zCell, bool fixWinding )
 	{
+		// The original winding faced every wall into the solid
+		bool faceNegativeX = fixWinding ? facing < 0 : facing > 0;
+
 		int countZ = (int)( 2.0f * (float)m_halfWidthU / zCell + 0.99f );
 		for ( int iz = 0; iz < countZ; ++iz )
 		{
@@ -880,7 +1059,7 @@ public:
 			b3Vec3 t0 = { SRC * x, SRC * y1, SRC * z0 };
 			b3Vec3 t1 = { SRC * x, SRC * y1, SRC * z1 };
 
-			if ( facing > 0 )
+			if ( faceNegativeX )
 			{
 				EmitTriangle( vertices, indices, b0, b1, t1 );
 				EmitTriangle( vertices, indices, b0, t1, t0 );
@@ -899,6 +1078,57 @@ public:
 		*o0 = a0 > c0 ? a0 : c0;
 		*o1 = a1 < c1 ? a1 : c1;
 		return *o1 - *o0 > 0.01f;
+	}
+
+	// Weld exact duplicates, then let meshoptimizer collapse every edge that leaves the surface in
+	// place. A t-junction vertex sits on an open border, so it can slide along that border onto a
+	// corner, which closes the seam. Flat collapses still cost a little from the simplifier's
+	// vertex regularization, so the error limit has to clear that while staying far below the inch
+	// scale cost of collapsing a real crease. Regularize options raise that cost. Vertex kinds are
+	// fixed per call, so a corner locked by a t-junction stays locked after its seam closes.
+	// Repeating reclassifies, but the error limit applies per pass, so deviation can accumulate.
+	// Winding is not repaired. Returns the number of passes.
+	static int Remesh( std::vector<b3Vec3>& vertices, std::vector<int32_t>& indices, float errorLimit,
+					   unsigned int options, bool repeat )
+	{
+		size_t indexCount = indices.size();
+		const unsigned int* sourceIndices = reinterpret_cast<const unsigned int*>( indices.data() );
+
+		std::vector<unsigned int> remap( vertices.size() );
+		size_t vertexCount = meshopt_generateVertexRemap( remap.data(), sourceIndices, indexCount, vertices.data(),
+														  vertices.size(), sizeof( b3Vec3 ) );
+
+		std::vector<unsigned int> welded( indexCount );
+		meshopt_remapIndexBuffer( welded.data(), sourceIndices, indexCount, remap.data() );
+
+		std::vector<b3Vec3> positions( vertexCount );
+		meshopt_remapVertexBuffer( positions.data(), vertices.data(), vertices.size(), sizeof( b3Vec3 ), remap.data() );
+
+		std::vector<unsigned int> simplified( indexCount );
+		int passCount = 0;
+		for ( ;; )
+		{
+			size_t simplifiedCount =
+				meshopt_simplify( simplified.data(), welded.data(), welded.size(), &positions[0].x, vertexCount,
+								  sizeof( b3Vec3 ), 0, errorLimit, meshopt_SimplifyErrorAbsolute | options, nullptr );
+			passCount += 1;
+
+			bool reduced = simplifiedCount < welded.size();
+			welded.assign( simplified.begin(), simplified.begin() + simplifiedCount );
+
+			if ( repeat == false || reduced == false )
+			{
+				break;
+			}
+		}
+
+		size_t usedCount = meshopt_optimizeVertexFetch( positions.data(), welded.data(), welded.size(),
+														positions.data(), vertexCount, sizeof( b3Vec3 ) );
+		positions.resize( usedCount );
+
+		vertices = positions;
+		indices.assign( welded.begin(), welded.end() );
+		return passCount;
 	}
 
 	void CreateFloorChunk( int chunk, float x0U, float x1U )
@@ -924,8 +1154,11 @@ public:
 				float tx1 = b3MinFloat( tx + (float)m_tileSizeU, s1 );
 				for ( int tz = -m_halfWidthU; tz < m_halfWidthU; tz += m_tileSizeU )
 				{
+					// Seeded by side rather than chunk so combined and split floors tessellate the
+					// same
+					uint32_t side = tx < 0.0f ? 0u : 1u;
 					uint32_t h = Hash( (uint32_t)( (int)tx * 73856093 ) ^ (uint32_t)( tz * 19349663 ) ^
-									   (uint32_t)( chunk * 2654435761u ) );
+									   (uint32_t)( side * 2654435761u ) );
 					float cells[3] = { 4.0f, 8.0f, 16.0f };
 					EmitPatch( vertices, indices, tx, tx1, (float)tz, (float)( tz + m_tileSizeU ), 0.0f, cells[h % 3] );
 				}
@@ -935,6 +1168,9 @@ public:
 		// --- Beam section: flat tops at y = 0, chamfers dropping to pits ---
 		float pitTop = -m_chamferDropU;
 		float pitBottom = -m_pitDepthU;
+
+		// Coarse walls and pit floors leave t-junctions against the 8 inch chamfer cells
+		float wellCell = 16.0f;
 
 		for ( int k = 0; k < m_beamCount; ++k )
 		{
@@ -953,11 +1189,12 @@ public:
 			// Chamfers sloping below the walkable plane
 			if ( pitLeft && bx >= x0U && bx < x1U )
 			{
-				EmitSlope( vertices, indices, bx, pitTop, bx + m_chamferWidthU, 0.0f, 8.0f );
+				EmitSlope( vertices, indices, bx, pitTop, bx + m_chamferWidthU, 0.0f, 8.0f, m_fixWinding );
 			}
 			if ( pitRight && bx + m_beamWidthU > x0U && bx + m_beamWidthU <= x1U )
 			{
-				EmitSlope( vertices, indices, bx + m_beamWidthU, pitTop, bx + m_beamWidthU - m_chamferWidthU, 0.0f, 8.0f );
+				EmitSlope( vertices, indices, bx + m_beamWidthU, pitTop, bx + m_beamWidthU - m_chamferWidthU, 0.0f,
+						   8.0f, m_fixWinding );
 			}
 
 			// Pit to the right of this beam
@@ -967,18 +1204,27 @@ public:
 				float pitR = bx + m_beamPitchU;
 				if ( pitL >= x0U && pitL < x1U )
 				{
-					EmitWall( vertices, indices, pitL, pitBottom, pitTop, +1, 16.0f );
+					EmitWall( vertices, indices, pitL, pitBottom, pitTop, +1, wellCell, m_fixWinding );
 				}
 				if ( pitR > x0U && pitR <= x1U )
 				{
-					EmitWall( vertices, indices, pitR, pitBottom, pitTop, -1, 16.0f );
+					EmitWall( vertices, indices, pitR, pitBottom, pitTop, -1, wellCell, m_fixWinding );
 				}
 				if ( ClipSpan( pitL, pitR, x0U, x1U, &s0, &s1 ) )
 				{
-					EmitPatch( vertices, indices, s0, s1, -(float)m_halfWidthU, (float)m_halfWidthU, pitBottom, 16.0f );
+					EmitPatch( vertices, indices, s0, s1, -(float)m_halfWidthU, (float)m_halfWidthU, pitBottom,
+							   wellCell );
 				}
 			}
 		}
+
+		if ( m_remesh )
+		{
+			m_simplifyPassCount[chunk] =
+				Remesh( vertices, indices, 0.001f * m_simplifyErrorMillimeters, 0, m_repeatSimplify );
+		}
+
+		m_chunkTriangleCount[chunk] = (int)( indices.size() / 3 );
 
 		b3MeshDef meshDef = {};
 		meshDef.vertices = vertices.data();
@@ -992,10 +1238,10 @@ public:
 		m_chunkMesh[chunk] = b3CreateMesh( &meshDef, nullptr, 0 );
 
 		b3BodyDef bodyDef = b3DefaultBodyDef();
-		b3BodyId body = b3CreateBody( m_worldId, &bodyDef );
+		m_chunkBodyIds[chunk] = b3CreateBody( m_worldId, &bodyDef );
 
 		b3ShapeDef shapeDef = b3DefaultShapeDef();
-		b3CreateMeshShape( body, &shapeDef, m_chunkMesh[chunk], b3Vec3_one );
+		b3CreateMeshShape( m_chunkBodyIds[chunk], &shapeDef, m_chunkMesh[chunk], b3Vec3_one );
 	}
 
 	void Step() override
@@ -1063,6 +1309,21 @@ public:
 		DrawTextLine( "ghost launches: %d, worst: %.2f m/s (%.0f inch/s)", m_launchCount, m_maxLaunchSpeed,
 					  m_maxLaunchSpeed / SRC );
 		DrawTextLine( "vertical velocity: %.2f m/s", currentVelocity.y );
+		if ( m_combineChunks )
+		{
+			DrawTextLine( "floor triangles: %d", m_chunkTriangleCount[0] );
+		}
+		else
+		{
+			DrawTextLine( "floor triangles: %d (chunks %d + %d)", m_chunkTriangleCount[0] + m_chunkTriangleCount[1],
+						  m_chunkTriangleCount[0], m_chunkTriangleCount[1] );
+		}
+
+		if ( m_remesh )
+		{
+			DrawTextLine( m_combineChunks ? "simplify passes: %d" : "simplify passes: %d + %d", m_simplifyPassCount[0],
+						  m_simplifyPassCount[1] );
+		}
 	}
 
 	bool DrawControls() override
@@ -1079,7 +1340,23 @@ public:
 			m_walkSpeedZ = speedUZ * SRC;
 		}
 
-		if ( ImGui::Button( "Reset Counters" ) )
+		bool rebuild = ImGui::Checkbox( "Fix Winding", &m_fixWinding );
+		rebuild = ImGui::Checkbox( "Combine Chunks", &m_combineChunks ) || rebuild;
+		rebuild = ImGui::Checkbox( "Remesh (meshoptimizer)", &m_remesh ) || rebuild;
+
+		ImGui::SliderFloat( "Simplify Error (mm)", &m_simplifyErrorMillimeters, 0.1f, 50.0f, "%.1f",
+							ImGuiSliderFlags_Logarithmic );
+		rebuild = ( ImGui::IsItemDeactivatedAfterEdit() && m_remesh ) || rebuild;
+
+		rebuild = ( ImGui::Checkbox( "Repeat Simplify", &m_repeatSimplify ) && m_remesh ) || rebuild;
+
+		if ( rebuild )
+		{
+			DestroyFloor();
+			CreateFloor();
+		}
+
+		if ( ImGui::Button( "Reset Counters" ) || rebuild )
 		{
 			m_launchCount = 0;
 			m_maxLaunchSpeed = 0.0f;
@@ -1101,6 +1378,14 @@ public:
 	static constexpr int m_markerCapacity = 64;
 
 	b3MeshData* m_chunkMesh[2] = {};
+	b3BodyId m_chunkBodyIds[2] = { b3_nullBodyId, b3_nullBodyId };
+	bool m_fixWinding;
+	bool m_combineChunks;
+	bool m_remesh;
+	float m_simplifyErrorMillimeters;
+	bool m_repeatSimplify;
+	int m_simplifyPassCount[2] = {};
+	int m_chunkTriangleCount[2] = {};
 	b3BodyId m_characterId;
 	float m_walkDirectionX;
 	float m_walkDirectionZ;
@@ -1113,115 +1398,169 @@ public:
 	int m_launchMarkerCount;
 };
 
-static int sampleSBoxGhostCollisions = RegisterSample( "Issues", "s&box Ghost Collisions", SBoxGhostCollisions::Create );
+static int sampleSBoxGhostCollisions =
+	RegisterSample( "Issues", "s&box Ghost Collisions", SBoxGhostCollisions::Create );
 
 static const b3Vec3 s_metalWheel1Verts[317] = {
-	{ 0.010279f, 0.086341f, 0.051768f },	{ -0.010314f, -0.084708f, 0.051804f },	{ 0.010279f, -0.084708f, 0.051768f },
-	{ -0.010314f, 0.086341f, 0.051804f },	{ 0.029138f, -0.084708f, -0.043911f },	{ 0.043724f, -0.084708f, -0.029376f },
-	{ 0.010098f, -0.084708f, -0.051759f },	{ -0.010494f, -0.084708f, -0.051723f }, { 0.051638f, -0.084708f, -0.010364f },
-	{ 0.051674f, -0.084708f, 0.010229f },	{ 0.043827f, -0.084708f, 0.029268f },	{ 0.029291f, -0.084708f, 0.043855f },
-	{ -0.029353f, -0.084708f, 0.043957f },	{ -0.051889f, -0.084708f, -0.010183f }, { -0.051853f, -0.084708f, 0.010409f },
-	{ -0.043939f, -0.084708f, 0.029421f },	{ -0.029506f, -0.084708f, -0.043809f }, { -0.044042f, -0.084708f, -0.029222f },
-	{ -0.029353f, 0.086341f, 0.043957f },	{ 0.043724f, 0.086341f, -0.029376f },	{ 0.029138f, 0.086341f, -0.043911f },
-	{ 0.010098f, 0.086341f, -0.051759f },	{ 0.051638f, 0.086341f, -0.010364f },	{ 0.051674f, 0.086341f, 0.010229f },
-	{ -0.044042f, 0.086341f, -0.029222f },	{ 0.043827f, 0.086341f, 0.029268f },	{ -0.051889f, 0.086341f, -0.010183f },
-	{ -0.043939f, 0.086341f, 0.029421f },	{ -0.029506f, 0.086341f, -0.043809f },	{ 0.035354f, 0.070897f, 0.035658f },
-	{ 0.035354f, -0.069397f, 0.035658f },	{ -0.035498f, 0.070897f, 0.035658f },	{ -0.035498f, -0.069397f, 0.035658f },
-	{ 0.035354f, -0.069397f, 0.365503f },	{ 0.035354f, 0.070897f, 0.365503f },	{ -0.035498f, 0.070897f, 0.365503f },
-	{ -0.035498f, -0.069397f, 0.365503f },	{ 0.035354f, 0.070897f, -0.365033f },	{ 0.035354f, -0.069397f, -0.365033f },
-	{ -0.035498f, 0.070897f, -0.365033f },	{ -0.035498f, -0.069397f, -0.365033f }, { 0.035354f, -0.069397f, -0.035187f },
-	{ 0.035354f, 0.070897f, -0.035187f },	{ -0.035498f, 0.070897f, -0.035187f },	{ -0.035498f, -0.069397f, -0.035187f },
-	{ -0.035494f, -0.069397f, -0.035191f }, { -0.365340f, -0.069397f, -0.035191f }, { -0.035494f, 0.070897f, -0.035191f },
-	{ -0.365340f, 0.070897f, -0.035191f },	{ -0.365340f, -0.069397f, 0.035661f },	{ -0.035494f, -0.069397f, 0.035661f },
-	{ -0.035494f, 0.070897f, 0.035661f },	{ -0.365340f, 0.070897f, 0.035661f },	{ 0.035350f, 0.070897f, -0.035191f },
-	{ 0.365196f, 0.070897f, -0.035191f },	{ 0.035350f, -0.069397f, -0.035191f },	{ 0.365196f, -0.069397f, -0.035191f },
-	{ 0.365196f, 0.070897f, 0.035661f },	{ 0.035350f, 0.070897f, 0.035661f },	{ 0.035350f, -0.069397f, 0.035661f },
-	{ 0.365196f, -0.069397f, 0.035661f },	{ -0.070802f, 0.086337f, 0.355420f },	{ -0.070802f, -0.084705f, 0.355420f },
-	{ -0.097081f, 0.086335f, 0.487537f },	{ -0.097081f, -0.084704f, 0.487537f },	{ -0.000108f, 0.086337f, 0.362383f },
-	{ -0.000108f, 0.086335f, 0.497088f },	{ -0.000108f, -0.084704f, 0.497088f },	{ -0.000108f, -0.084705f, 0.362383f },
-	{ -0.138787f, -0.084705f, 0.334799f },	{ -0.138787f, 0.086337f, 0.334799f },	{ -0.070810f, -0.084705f, 0.355419f },
-	{ -0.070810f, 0.086337f, 0.355419f },	{ -0.097090f, 0.086335f, 0.487536f },	{ -0.190336f, 0.086335f, 0.459250f },
-	{ -0.190336f, -0.084704f, 0.459250f },	{ -0.097090f, -0.084704f, 0.487536f },	{ -0.138795f, 0.086337f, 0.334796f },
-	{ -0.138795f, -0.084705f, 0.334796f },	{ -0.201442f, 0.086337f, 0.301310f },	{ -0.201442f, -0.084705f, 0.301310f },
-	{ -0.276280f, -0.084704f, 0.413313f },	{ -0.276280f, 0.086335f, 0.413313f },	{ -0.190344f, 0.086335f, 0.459247f },
-	{ -0.190344f, -0.084704f, 0.459247f },	{ -0.201450f, -0.084705f, 0.301306f },	{ -0.256361f, -0.084705f, 0.256241f },
-	{ -0.201450f, 0.086337f, 0.301306f },	{ -0.256361f, 0.086337f, 0.256241f },	{ -0.351612f, 0.086335f, 0.351492f },
-	{ -0.351612f, -0.084704f, 0.351492f },	{ -0.276288f, 0.086335f, 0.413309f },	{ -0.276288f, -0.084704f, 0.413309f },
-	{ -0.301431f, -0.084705f, 0.201325f },	{ -0.413435f, -0.084704f, 0.276163f },	{ -0.413435f, 0.086335f, 0.276163f },
-	{ -0.301431f, 0.086337f, 0.201325f },	{ -0.256367f, -0.084705f, 0.256236f },	{ -0.256367f, 0.086337f, 0.256236f },
-	{ -0.351618f, 0.086335f, 0.351487f },	{ -0.351618f, -0.084704f, 0.351487f },	{ -0.334922f, -0.084705f, 0.138670f },
-	{ -0.459374f, -0.084704f, 0.190220f },	{ -0.459374f, 0.086335f, 0.190220f },	{ -0.334922f, 0.086337f, 0.138670f },
-	{ -0.301436f, 0.086337f, 0.201318f },	{ -0.301436f, -0.084705f, 0.201318f },	{ -0.413440f, 0.086335f, 0.276156f },
-	{ -0.413440f, -0.084704f, 0.276156f },	{ -0.487663f, -0.084704f, 0.096966f },	{ -0.355546f, -0.084705f, 0.070686f },
-	{ -0.459377f, -0.084704f, 0.190212f },	{ -0.334926f, -0.084705f, 0.138663f },	{ -0.355546f, 0.086337f, 0.070686f },
-	{ -0.334926f, 0.086337f, 0.138663f },	{ -0.487663f, 0.086335f, 0.096966f },	{ -0.459377f, 0.086335f, 0.190212f },
-	{ -0.362511f, -0.084705f, -0.000016f }, { -0.355549f, -0.084705f, 0.070678f },	{ -0.497217f, -0.084704f, -0.000016f },
-	{ -0.487665f, -0.084704f, 0.096957f },	{ -0.497217f, 0.086335f, -0.000016f },	{ -0.362511f, 0.086337f, -0.000016f },
-	{ -0.355549f, 0.086337f, 0.070678f },	{ -0.487665f, 0.086335f, 0.096957f },	{ -0.362512f, 0.086337f, -0.000024f },
-	{ -0.362512f, -0.084705f, -0.000024f }, { -0.355549f, 0.086337f, -0.070717f },	{ -0.355549f, -0.084705f, -0.070717f },
-	{ -0.497217f, -0.084704f, -0.000024f }, { -0.487666f, -0.084704f, -0.096997f }, { -0.497217f, 0.086335f, -0.000024f },
-	{ -0.487666f, 0.086335f, -0.096997f },	{ -0.334927f, -0.084705f, -0.138702f }, { -0.355548f, 0.086337f, -0.070726f },
-	{ -0.355548f, -0.084705f, -0.070726f }, { -0.334927f, 0.086337f, -0.138702f },	{ -0.487665f, -0.084704f, -0.097005f },
-	{ -0.459379f, -0.084704f, -0.190252f }, { -0.487665f, 0.086335f, -0.097005f },	{ -0.459379f, 0.086335f, -0.190252f },
-	{ -0.413442f, -0.084704f, -0.276196f }, { -0.301439f, -0.084705f, -0.201358f }, { -0.334925f, -0.084705f, -0.138710f },
-	{ -0.459376f, -0.084704f, -0.190260f }, { -0.334925f, 0.086337f, -0.138710f },	{ -0.301439f, 0.086337f, -0.201358f },
-	{ -0.459376f, 0.086335f, -0.190260f },	{ -0.413442f, 0.086335f, -0.276196f },	{ -0.256370f, -0.084705f, -0.256276f },
-	{ -0.301434f, 0.086337f, -0.201365f },	{ -0.301434f, -0.084705f, -0.201365f }, { -0.256370f, 0.086337f, -0.256276f },
-	{ -0.413438f, 0.086335f, -0.276203f },	{ -0.351621f, 0.086335f, -0.351527f },	{ -0.413438f, -0.084704f, -0.276203f },
-	{ -0.351621f, -0.084704f, -0.351527f }, { -0.256364f, -0.084705f, -0.256283f }, { -0.201453f, 0.086337f, -0.301347f },
-	{ -0.256364f, 0.086337f, -0.256283f },	{ -0.201453f, -0.084705f, -0.301347f }, { -0.276292f, -0.084704f, -0.413350f },
-	{ -0.351615f, -0.084704f, -0.351534f }, { -0.351615f, 0.086335f, -0.351534f },	{ -0.276292f, 0.086335f, -0.413350f },
-	{ -0.201447f, -0.084705f, -0.301352f }, { -0.276285f, -0.084704f, -0.413355f }, { -0.138799f, -0.084705f, -0.334838f },
-	{ -0.190349f, -0.084704f, -0.459289f }, { -0.276285f, 0.086335f, -0.413355f },	{ -0.201447f, 0.086337f, -0.301352f },
-	{ -0.190349f, 0.086335f, -0.459289f },	{ -0.138799f, 0.086337f, -0.334838f },	{ -0.190341f, 0.086335f, -0.459293f },
-	{ -0.190341f, -0.084704f, -0.459293f }, { -0.138791f, -0.084705f, -0.334842f }, { -0.138791f, 0.086337f, -0.334842f },
-	{ -0.070815f, 0.086337f, -0.355462f },	{ -0.070815f, -0.084705f, -0.355462f }, { -0.097095f, 0.086335f, -0.487579f },
-	{ -0.097095f, -0.084704f, -0.487579f }, { -0.070807f, 0.086337f, -0.355464f },	{ -0.097086f, 0.086335f, -0.487581f },
-	{ -0.097086f, -0.084704f, -0.487581f }, { -0.070807f, -0.084705f, -0.355464f }, { -0.000113f, -0.084705f, -0.362427f },
-	{ -0.000113f, 0.086337f, -0.362427f },	{ -0.000113f, 0.086335f, -0.497132f },	{ -0.000113f, -0.084704f, -0.497132f },
-	{ 0.070588f, 0.086337f, -0.355465f },	{ 0.096868f, -0.084704f, -0.487582f },	{ 0.096868f, 0.086335f, -0.487582f },
-	{ 0.070588f, -0.084705f, -0.355465f },	{ -0.000105f, 0.086337f, -0.362427f },	{ -0.000105f, 0.086335f, -0.497133f },
-	{ -0.000105f, -0.084704f, -0.497133f }, { -0.000105f, -0.084705f, -0.362427f }, { 0.190123f, -0.084704f, -0.459294f },
-	{ 0.190123f, 0.086335f, -0.459294f },	{ 0.138573f, -0.084705f, -0.334843f },	{ 0.138573f, 0.086337f, -0.334843f },
-	{ 0.070597f, 0.086337f, -0.355463f },	{ 0.070597f, -0.084705f, -0.355463f },	{ 0.096876f, -0.084704f, -0.487580f },
-	{ 0.096876f, 0.086335f, -0.487580f },	{ 0.201229f, -0.084705f, -0.301354f },	{ 0.276067f, -0.084704f, -0.413358f },
-	{ 0.201229f, 0.086337f, -0.301354f },	{ 0.138581f, -0.084705f, -0.334840f },	{ 0.138581f, 0.086337f, -0.334840f },
-	{ 0.190131f, 0.086335f, -0.459292f },	{ 0.276067f, 0.086335f, -0.413358f },	{ 0.190131f, -0.084704f, -0.459292f },
-	{ 0.201236f, 0.086337f, -0.301350f },	{ 0.256147f, -0.084705f, -0.256286f },	{ 0.256147f, 0.086337f, -0.256286f },
-	{ 0.201236f, -0.084705f, -0.301350f },	{ 0.351398f, -0.084704f, -0.351537f },	{ 0.351398f, 0.086335f, -0.351537f },
-	{ 0.276074f, -0.084704f, -0.413353f },	{ 0.276074f, 0.086335f, -0.413353f },	{ 0.301218f, -0.084705f, -0.201369f },
-	{ 0.301218f, 0.086337f, -0.201369f },	{ 0.256154f, -0.084705f, -0.256280f },	{ 0.256154f, 0.086337f, -0.256280f },
-	{ 0.413221f, 0.086335f, -0.276207f },	{ 0.413221f, -0.084704f, -0.276207f },	{ 0.351405f, 0.086335f, -0.351531f },
-	{ 0.351405f, -0.084704f, -0.351531f },	{ 0.334709f, 0.086337f, -0.138715f },	{ 0.301223f, 0.086337f, -0.201362f },
-	{ 0.334709f, -0.084705f, -0.138715f },	{ 0.301223f, -0.084705f, -0.201362f },	{ 0.459160f, -0.084704f, -0.190264f },
-	{ 0.459160f, 0.086335f, -0.190264f },	{ 0.413226f, 0.086335f, -0.276200f },	{ 0.413226f, -0.084704f, -0.276200f },
-	{ 0.334713f, -0.084705f, -0.138707f },	{ 0.355333f, -0.084705f, -0.070731f },	{ 0.334713f, 0.086337f, -0.138707f },
-	{ 0.355333f, 0.086337f, -0.070731f },	{ 0.459164f, 0.086335f, -0.190257f },	{ 0.487450f, 0.086335f, -0.097010f },
-	{ 0.487450f, -0.084704f, -0.097010f },	{ 0.459164f, -0.084704f, -0.190257f },	{ 0.355335f, -0.084705f, -0.070722f },
-	{ 0.362298f, -0.084705f, -0.000029f },	{ 0.355335f, 0.086337f, -0.070722f },	{ 0.362298f, 0.086337f, -0.000029f },
-	{ 0.497003f, -0.084704f, -0.000029f },	{ 0.497003f, 0.086335f, -0.000029f },	{ 0.487452f, 0.086335f, -0.097002f },
-	{ 0.487452f, -0.084704f, -0.097002f },	{ 0.362298f, -0.084705f, -0.000021f },	{ 0.497003f, -0.084704f, -0.000021f },
-	{ 0.355336f, -0.084705f, 0.070673f },	{ 0.487453f, -0.084704f, 0.096952f },	{ 0.497003f, 0.086335f, -0.000021f },
-	{ 0.362298f, 0.086337f, -0.000021f },	{ 0.355336f, 0.086337f, 0.070673f },	{ 0.487453f, 0.086335f, 0.096952f },
-	{ 0.355334f, -0.084705f, 0.070681f },	{ 0.355334f, 0.086337f, 0.070681f },	{ 0.487451f, 0.086335f, 0.096961f },
-	{ 0.487451f, -0.084704f, 0.096961f },	{ 0.334714f, -0.084705f, 0.138658f },	{ 0.459165f, -0.084704f, 0.190207f },
-	{ 0.334714f, 0.086337f, 0.138658f },	{ 0.459165f, 0.086335f, 0.190207f },	{ 0.334711f, 0.086337f, 0.138666f },
-	{ 0.301225f, 0.086337f, 0.201313f },	{ 0.459163f, 0.086335f, 0.190215f },	{ 0.413229f, 0.086335f, 0.276151f },
-	{ 0.334711f, -0.084705f, 0.138666f },	{ 0.301225f, -0.084705f, 0.201313f },	{ 0.413229f, -0.084704f, 0.276151f },
-	{ 0.459163f, -0.084704f, 0.190215f },	{ 0.301221f, -0.084705f, 0.201321f },	{ 0.256157f, -0.084705f, 0.256232f },
-	{ 0.301221f, 0.086337f, 0.201321f },	{ 0.256157f, 0.086337f, 0.256232f },	{ 0.413224f, -0.084704f, 0.276159f },
-	{ 0.413224f, 0.086335f, 0.276159f },	{ 0.351408f, 0.086335f, 0.351483f },	{ 0.351408f, -0.084704f, 0.351483f },
-	{ 0.201240f, -0.084705f, 0.301302f },	{ 0.201240f, 0.086337f, 0.301302f },	{ 0.256151f, -0.084705f, 0.256238f },
-	{ 0.256151f, 0.086337f, 0.256238f },	{ 0.351402f, 0.086335f, 0.351489f },	{ 0.351402f, -0.084704f, 0.351489f },
-	{ 0.276078f, 0.086335f, 0.413305f },	{ 0.276078f, -0.084704f, 0.413305f },	{ 0.138586f, -0.084705f, 0.334793f },
-	{ 0.201233f, -0.084705f, 0.301307f },	{ 0.190135f, -0.084704f, 0.459244f },	{ 0.276071f, -0.084704f, 0.413311f },
-	{ 0.201233f, 0.086337f, 0.301307f },	{ 0.138586f, 0.086337f, 0.334793f },	{ 0.276071f, 0.086335f, 0.413311f },
-	{ 0.190135f, 0.086335f, 0.459244f },	{ 0.138578f, -0.084705f, 0.334797f },	{ 0.070602f, -0.084705f, 0.355417f },
-	{ 0.138578f, 0.086337f, 0.334797f },	{ 0.070602f, 0.086337f, 0.355417f },	{ 0.190127f, 0.086335f, 0.459248f },
-	{ 0.190127f, -0.084704f, 0.459248f },	{ 0.096881f, 0.086335f, 0.487534f },	{ 0.096881f, -0.084704f, 0.487534f },
-	{ 0.070593f, -0.084705f, 0.355419f },	{ 0.096873f, 0.086335f, 0.487536f },	{ 0.096873f, -0.084704f, 0.487536f },
-	{ 0.070593f, 0.086337f, 0.355419f },	{ -0.000100f, 0.086337f, 0.362382f },	{ -0.000100f, 0.086335f, 0.497087f },
-	{ -0.000100f, -0.084704f, 0.497087f },	{ -0.000100f, -0.084705f, 0.362382f },
+	{ 0.010279f, 0.086341f, 0.051768f },	{ -0.010314f, -0.084708f, 0.051804f },
+	{ 0.010279f, -0.084708f, 0.051768f },	{ -0.010314f, 0.086341f, 0.051804f },
+	{ 0.029138f, -0.084708f, -0.043911f },	{ 0.043724f, -0.084708f, -0.029376f },
+	{ 0.010098f, -0.084708f, -0.051759f },	{ -0.010494f, -0.084708f, -0.051723f },
+	{ 0.051638f, -0.084708f, -0.010364f },	{ 0.051674f, -0.084708f, 0.010229f },
+	{ 0.043827f, -0.084708f, 0.029268f },	{ 0.029291f, -0.084708f, 0.043855f },
+	{ -0.029353f, -0.084708f, 0.043957f },	{ -0.051889f, -0.084708f, -0.010183f },
+	{ -0.051853f, -0.084708f, 0.010409f },	{ -0.043939f, -0.084708f, 0.029421f },
+	{ -0.029506f, -0.084708f, -0.043809f }, { -0.044042f, -0.084708f, -0.029222f },
+	{ -0.029353f, 0.086341f, 0.043957f },	{ 0.043724f, 0.086341f, -0.029376f },
+	{ 0.029138f, 0.086341f, -0.043911f },	{ 0.010098f, 0.086341f, -0.051759f },
+	{ 0.051638f, 0.086341f, -0.010364f },	{ 0.051674f, 0.086341f, 0.010229f },
+	{ -0.044042f, 0.086341f, -0.029222f },	{ 0.043827f, 0.086341f, 0.029268f },
+	{ -0.051889f, 0.086341f, -0.010183f },	{ -0.043939f, 0.086341f, 0.029421f },
+	{ -0.029506f, 0.086341f, -0.043809f },	{ 0.035354f, 0.070897f, 0.035658f },
+	{ 0.035354f, -0.069397f, 0.035658f },	{ -0.035498f, 0.070897f, 0.035658f },
+	{ -0.035498f, -0.069397f, 0.035658f },	{ 0.035354f, -0.069397f, 0.365503f },
+	{ 0.035354f, 0.070897f, 0.365503f },	{ -0.035498f, 0.070897f, 0.365503f },
+	{ -0.035498f, -0.069397f, 0.365503f },	{ 0.035354f, 0.070897f, -0.365033f },
+	{ 0.035354f, -0.069397f, -0.365033f },	{ -0.035498f, 0.070897f, -0.365033f },
+	{ -0.035498f, -0.069397f, -0.365033f }, { 0.035354f, -0.069397f, -0.035187f },
+	{ 0.035354f, 0.070897f, -0.035187f },	{ -0.035498f, 0.070897f, -0.035187f },
+	{ -0.035498f, -0.069397f, -0.035187f }, { -0.035494f, -0.069397f, -0.035191f },
+	{ -0.365340f, -0.069397f, -0.035191f }, { -0.035494f, 0.070897f, -0.035191f },
+	{ -0.365340f, 0.070897f, -0.035191f },	{ -0.365340f, -0.069397f, 0.035661f },
+	{ -0.035494f, -0.069397f, 0.035661f },	{ -0.035494f, 0.070897f, 0.035661f },
+	{ -0.365340f, 0.070897f, 0.035661f },	{ 0.035350f, 0.070897f, -0.035191f },
+	{ 0.365196f, 0.070897f, -0.035191f },	{ 0.035350f, -0.069397f, -0.035191f },
+	{ 0.365196f, -0.069397f, -0.035191f },	{ 0.365196f, 0.070897f, 0.035661f },
+	{ 0.035350f, 0.070897f, 0.035661f },	{ 0.035350f, -0.069397f, 0.035661f },
+	{ 0.365196f, -0.069397f, 0.035661f },	{ -0.070802f, 0.086337f, 0.355420f },
+	{ -0.070802f, -0.084705f, 0.355420f },	{ -0.097081f, 0.086335f, 0.487537f },
+	{ -0.097081f, -0.084704f, 0.487537f },	{ -0.000108f, 0.086337f, 0.362383f },
+	{ -0.000108f, 0.086335f, 0.497088f },	{ -0.000108f, -0.084704f, 0.497088f },
+	{ -0.000108f, -0.084705f, 0.362383f },	{ -0.138787f, -0.084705f, 0.334799f },
+	{ -0.138787f, 0.086337f, 0.334799f },	{ -0.070810f, -0.084705f, 0.355419f },
+	{ -0.070810f, 0.086337f, 0.355419f },	{ -0.097090f, 0.086335f, 0.487536f },
+	{ -0.190336f, 0.086335f, 0.459250f },	{ -0.190336f, -0.084704f, 0.459250f },
+	{ -0.097090f, -0.084704f, 0.487536f },	{ -0.138795f, 0.086337f, 0.334796f },
+	{ -0.138795f, -0.084705f, 0.334796f },	{ -0.201442f, 0.086337f, 0.301310f },
+	{ -0.201442f, -0.084705f, 0.301310f },	{ -0.276280f, -0.084704f, 0.413313f },
+	{ -0.276280f, 0.086335f, 0.413313f },	{ -0.190344f, 0.086335f, 0.459247f },
+	{ -0.190344f, -0.084704f, 0.459247f },	{ -0.201450f, -0.084705f, 0.301306f },
+	{ -0.256361f, -0.084705f, 0.256241f },	{ -0.201450f, 0.086337f, 0.301306f },
+	{ -0.256361f, 0.086337f, 0.256241f },	{ -0.351612f, 0.086335f, 0.351492f },
+	{ -0.351612f, -0.084704f, 0.351492f },	{ -0.276288f, 0.086335f, 0.413309f },
+	{ -0.276288f, -0.084704f, 0.413309f },	{ -0.301431f, -0.084705f, 0.201325f },
+	{ -0.413435f, -0.084704f, 0.276163f },	{ -0.413435f, 0.086335f, 0.276163f },
+	{ -0.301431f, 0.086337f, 0.201325f },	{ -0.256367f, -0.084705f, 0.256236f },
+	{ -0.256367f, 0.086337f, 0.256236f },	{ -0.351618f, 0.086335f, 0.351487f },
+	{ -0.351618f, -0.084704f, 0.351487f },	{ -0.334922f, -0.084705f, 0.138670f },
+	{ -0.459374f, -0.084704f, 0.190220f },	{ -0.459374f, 0.086335f, 0.190220f },
+	{ -0.334922f, 0.086337f, 0.138670f },	{ -0.301436f, 0.086337f, 0.201318f },
+	{ -0.301436f, -0.084705f, 0.201318f },	{ -0.413440f, 0.086335f, 0.276156f },
+	{ -0.413440f, -0.084704f, 0.276156f },	{ -0.487663f, -0.084704f, 0.096966f },
+	{ -0.355546f, -0.084705f, 0.070686f },	{ -0.459377f, -0.084704f, 0.190212f },
+	{ -0.334926f, -0.084705f, 0.138663f },	{ -0.355546f, 0.086337f, 0.070686f },
+	{ -0.334926f, 0.086337f, 0.138663f },	{ -0.487663f, 0.086335f, 0.096966f },
+	{ -0.459377f, 0.086335f, 0.190212f },	{ -0.362511f, -0.084705f, -0.000016f },
+	{ -0.355549f, -0.084705f, 0.070678f },	{ -0.497217f, -0.084704f, -0.000016f },
+	{ -0.487665f, -0.084704f, 0.096957f },	{ -0.497217f, 0.086335f, -0.000016f },
+	{ -0.362511f, 0.086337f, -0.000016f },	{ -0.355549f, 0.086337f, 0.070678f },
+	{ -0.487665f, 0.086335f, 0.096957f },	{ -0.362512f, 0.086337f, -0.000024f },
+	{ -0.362512f, -0.084705f, -0.000024f }, { -0.355549f, 0.086337f, -0.070717f },
+	{ -0.355549f, -0.084705f, -0.070717f }, { -0.497217f, -0.084704f, -0.000024f },
+	{ -0.487666f, -0.084704f, -0.096997f }, { -0.497217f, 0.086335f, -0.000024f },
+	{ -0.487666f, 0.086335f, -0.096997f },	{ -0.334927f, -0.084705f, -0.138702f },
+	{ -0.355548f, 0.086337f, -0.070726f },	{ -0.355548f, -0.084705f, -0.070726f },
+	{ -0.334927f, 0.086337f, -0.138702f },	{ -0.487665f, -0.084704f, -0.097005f },
+	{ -0.459379f, -0.084704f, -0.190252f }, { -0.487665f, 0.086335f, -0.097005f },
+	{ -0.459379f, 0.086335f, -0.190252f },	{ -0.413442f, -0.084704f, -0.276196f },
+	{ -0.301439f, -0.084705f, -0.201358f }, { -0.334925f, -0.084705f, -0.138710f },
+	{ -0.459376f, -0.084704f, -0.190260f }, { -0.334925f, 0.086337f, -0.138710f },
+	{ -0.301439f, 0.086337f, -0.201358f },	{ -0.459376f, 0.086335f, -0.190260f },
+	{ -0.413442f, 0.086335f, -0.276196f },	{ -0.256370f, -0.084705f, -0.256276f },
+	{ -0.301434f, 0.086337f, -0.201365f },	{ -0.301434f, -0.084705f, -0.201365f },
+	{ -0.256370f, 0.086337f, -0.256276f },	{ -0.413438f, 0.086335f, -0.276203f },
+	{ -0.351621f, 0.086335f, -0.351527f },	{ -0.413438f, -0.084704f, -0.276203f },
+	{ -0.351621f, -0.084704f, -0.351527f }, { -0.256364f, -0.084705f, -0.256283f },
+	{ -0.201453f, 0.086337f, -0.301347f },	{ -0.256364f, 0.086337f, -0.256283f },
+	{ -0.201453f, -0.084705f, -0.301347f }, { -0.276292f, -0.084704f, -0.413350f },
+	{ -0.351615f, -0.084704f, -0.351534f }, { -0.351615f, 0.086335f, -0.351534f },
+	{ -0.276292f, 0.086335f, -0.413350f },	{ -0.201447f, -0.084705f, -0.301352f },
+	{ -0.276285f, -0.084704f, -0.413355f }, { -0.138799f, -0.084705f, -0.334838f },
+	{ -0.190349f, -0.084704f, -0.459289f }, { -0.276285f, 0.086335f, -0.413355f },
+	{ -0.201447f, 0.086337f, -0.301352f },	{ -0.190349f, 0.086335f, -0.459289f },
+	{ -0.138799f, 0.086337f, -0.334838f },	{ -0.190341f, 0.086335f, -0.459293f },
+	{ -0.190341f, -0.084704f, -0.459293f }, { -0.138791f, -0.084705f, -0.334842f },
+	{ -0.138791f, 0.086337f, -0.334842f },	{ -0.070815f, 0.086337f, -0.355462f },
+	{ -0.070815f, -0.084705f, -0.355462f }, { -0.097095f, 0.086335f, -0.487579f },
+	{ -0.097095f, -0.084704f, -0.487579f }, { -0.070807f, 0.086337f, -0.355464f },
+	{ -0.097086f, 0.086335f, -0.487581f },	{ -0.097086f, -0.084704f, -0.487581f },
+	{ -0.070807f, -0.084705f, -0.355464f }, { -0.000113f, -0.084705f, -0.362427f },
+	{ -0.000113f, 0.086337f, -0.362427f },	{ -0.000113f, 0.086335f, -0.497132f },
+	{ -0.000113f, -0.084704f, -0.497132f }, { 0.070588f, 0.086337f, -0.355465f },
+	{ 0.096868f, -0.084704f, -0.487582f },	{ 0.096868f, 0.086335f, -0.487582f },
+	{ 0.070588f, -0.084705f, -0.355465f },	{ -0.000105f, 0.086337f, -0.362427f },
+	{ -0.000105f, 0.086335f, -0.497133f },	{ -0.000105f, -0.084704f, -0.497133f },
+	{ -0.000105f, -0.084705f, -0.362427f }, { 0.190123f, -0.084704f, -0.459294f },
+	{ 0.190123f, 0.086335f, -0.459294f },	{ 0.138573f, -0.084705f, -0.334843f },
+	{ 0.138573f, 0.086337f, -0.334843f },	{ 0.070597f, 0.086337f, -0.355463f },
+	{ 0.070597f, -0.084705f, -0.355463f },	{ 0.096876f, -0.084704f, -0.487580f },
+	{ 0.096876f, 0.086335f, -0.487580f },	{ 0.201229f, -0.084705f, -0.301354f },
+	{ 0.276067f, -0.084704f, -0.413358f },	{ 0.201229f, 0.086337f, -0.301354f },
+	{ 0.138581f, -0.084705f, -0.334840f },	{ 0.138581f, 0.086337f, -0.334840f },
+	{ 0.190131f, 0.086335f, -0.459292f },	{ 0.276067f, 0.086335f, -0.413358f },
+	{ 0.190131f, -0.084704f, -0.459292f },	{ 0.201236f, 0.086337f, -0.301350f },
+	{ 0.256147f, -0.084705f, -0.256286f },	{ 0.256147f, 0.086337f, -0.256286f },
+	{ 0.201236f, -0.084705f, -0.301350f },	{ 0.351398f, -0.084704f, -0.351537f },
+	{ 0.351398f, 0.086335f, -0.351537f },	{ 0.276074f, -0.084704f, -0.413353f },
+	{ 0.276074f, 0.086335f, -0.413353f },	{ 0.301218f, -0.084705f, -0.201369f },
+	{ 0.301218f, 0.086337f, -0.201369f },	{ 0.256154f, -0.084705f, -0.256280f },
+	{ 0.256154f, 0.086337f, -0.256280f },	{ 0.413221f, 0.086335f, -0.276207f },
+	{ 0.413221f, -0.084704f, -0.276207f },	{ 0.351405f, 0.086335f, -0.351531f },
+	{ 0.351405f, -0.084704f, -0.351531f },	{ 0.334709f, 0.086337f, -0.138715f },
+	{ 0.301223f, 0.086337f, -0.201362f },	{ 0.334709f, -0.084705f, -0.138715f },
+	{ 0.301223f, -0.084705f, -0.201362f },	{ 0.459160f, -0.084704f, -0.190264f },
+	{ 0.459160f, 0.086335f, -0.190264f },	{ 0.413226f, 0.086335f, -0.276200f },
+	{ 0.413226f, -0.084704f, -0.276200f },	{ 0.334713f, -0.084705f, -0.138707f },
+	{ 0.355333f, -0.084705f, -0.070731f },	{ 0.334713f, 0.086337f, -0.138707f },
+	{ 0.355333f, 0.086337f, -0.070731f },	{ 0.459164f, 0.086335f, -0.190257f },
+	{ 0.487450f, 0.086335f, -0.097010f },	{ 0.487450f, -0.084704f, -0.097010f },
+	{ 0.459164f, -0.084704f, -0.190257f },	{ 0.355335f, -0.084705f, -0.070722f },
+	{ 0.362298f, -0.084705f, -0.000029f },	{ 0.355335f, 0.086337f, -0.070722f },
+	{ 0.362298f, 0.086337f, -0.000029f },	{ 0.497003f, -0.084704f, -0.000029f },
+	{ 0.497003f, 0.086335f, -0.000029f },	{ 0.487452f, 0.086335f, -0.097002f },
+	{ 0.487452f, -0.084704f, -0.097002f },	{ 0.362298f, -0.084705f, -0.000021f },
+	{ 0.497003f, -0.084704f, -0.000021f },	{ 0.355336f, -0.084705f, 0.070673f },
+	{ 0.487453f, -0.084704f, 0.096952f },	{ 0.497003f, 0.086335f, -0.000021f },
+	{ 0.362298f, 0.086337f, -0.000021f },	{ 0.355336f, 0.086337f, 0.070673f },
+	{ 0.487453f, 0.086335f, 0.096952f },	{ 0.355334f, -0.084705f, 0.070681f },
+	{ 0.355334f, 0.086337f, 0.070681f },	{ 0.487451f, 0.086335f, 0.096961f },
+	{ 0.487451f, -0.084704f, 0.096961f },	{ 0.334714f, -0.084705f, 0.138658f },
+	{ 0.459165f, -0.084704f, 0.190207f },	{ 0.334714f, 0.086337f, 0.138658f },
+	{ 0.459165f, 0.086335f, 0.190207f },	{ 0.334711f, 0.086337f, 0.138666f },
+	{ 0.301225f, 0.086337f, 0.201313f },	{ 0.459163f, 0.086335f, 0.190215f },
+	{ 0.413229f, 0.086335f, 0.276151f },	{ 0.334711f, -0.084705f, 0.138666f },
+	{ 0.301225f, -0.084705f, 0.201313f },	{ 0.413229f, -0.084704f, 0.276151f },
+	{ 0.459163f, -0.084704f, 0.190215f },	{ 0.301221f, -0.084705f, 0.201321f },
+	{ 0.256157f, -0.084705f, 0.256232f },	{ 0.301221f, 0.086337f, 0.201321f },
+	{ 0.256157f, 0.086337f, 0.256232f },	{ 0.413224f, -0.084704f, 0.276159f },
+	{ 0.413224f, 0.086335f, 0.276159f },	{ 0.351408f, 0.086335f, 0.351483f },
+	{ 0.351408f, -0.084704f, 0.351483f },	{ 0.201240f, -0.084705f, 0.301302f },
+	{ 0.201240f, 0.086337f, 0.301302f },	{ 0.256151f, -0.084705f, 0.256238f },
+	{ 0.256151f, 0.086337f, 0.256238f },	{ 0.351402f, 0.086335f, 0.351489f },
+	{ 0.351402f, -0.084704f, 0.351489f },	{ 0.276078f, 0.086335f, 0.413305f },
+	{ 0.276078f, -0.084704f, 0.413305f },	{ 0.138586f, -0.084705f, 0.334793f },
+	{ 0.201233f, -0.084705f, 0.301307f },	{ 0.190135f, -0.084704f, 0.459244f },
+	{ 0.276071f, -0.084704f, 0.413311f },	{ 0.201233f, 0.086337f, 0.301307f },
+	{ 0.138586f, 0.086337f, 0.334793f },	{ 0.276071f, 0.086335f, 0.413311f },
+	{ 0.190135f, 0.086335f, 0.459244f },	{ 0.138578f, -0.084705f, 0.334797f },
+	{ 0.070602f, -0.084705f, 0.355417f },	{ 0.138578f, 0.086337f, 0.334797f },
+	{ 0.070602f, 0.086337f, 0.355417f },	{ 0.190127f, 0.086335f, 0.459248f },
+	{ 0.190127f, -0.084704f, 0.459248f },	{ 0.096881f, 0.086335f, 0.487534f },
+	{ 0.096881f, -0.084704f, 0.487534f },	{ 0.070593f, -0.084705f, 0.355419f },
+	{ 0.096873f, 0.086335f, 0.487536f },	{ 0.096873f, -0.084704f, 0.487536f },
+	{ 0.070593f, 0.086337f, 0.355419f },	{ -0.000100f, 0.086337f, 0.362382f },
+	{ -0.000100f, 0.086335f, 0.497087f },	{ -0.000100f, -0.084704f, 0.497087f },
+	{ -0.000100f, -0.084705f, 0.362382f },
 };
 
 typedef struct WheelHullSpan
@@ -1230,10 +1569,11 @@ typedef struct WheelHullSpan
 	int count;
 } WheelHullSpan;
 static const WheelHullSpan s_metalWheel1Hulls[37] = {
-	{ 0, 29 },	{ 29, 8 },	{ 37, 8 },	{ 45, 8 },	{ 53, 8 },	{ 61, 8 },	{ 69, 8 },	{ 77, 8 },	{ 85, 8 },	{ 93, 8 },
-	{ 101, 8 }, { 109, 8 }, { 117, 8 }, { 125, 8 }, { 133, 8 }, { 141, 8 }, { 149, 8 }, { 157, 8 }, { 165, 8 }, { 173, 8 },
-	{ 181, 8 }, { 189, 8 }, { 197, 8 }, { 205, 8 }, { 213, 8 }, { 221, 8 }, { 229, 8 }, { 237, 8 }, { 245, 8 }, { 253, 8 },
-	{ 261, 8 }, { 269, 8 }, { 277, 8 }, { 285, 8 }, { 293, 8 }, { 301, 8 }, { 309, 8 },
+	{ 0, 29 },	{ 29, 8 },	{ 37, 8 },	{ 45, 8 },	{ 53, 8 },	{ 61, 8 },	{ 69, 8 },	{ 77, 8 },
+	{ 85, 8 },	{ 93, 8 },	{ 101, 8 }, { 109, 8 }, { 117, 8 }, { 125, 8 }, { 133, 8 }, { 141, 8 },
+	{ 149, 8 }, { 157, 8 }, { 165, 8 }, { 173, 8 }, { 181, 8 }, { 189, 8 }, { 197, 8 }, { 205, 8 },
+	{ 213, 8 }, { 221, 8 }, { 229, 8 }, { 237, 8 }, { 245, 8 }, { 253, 8 }, { 261, 8 }, { 269, 8 },
+	{ 277, 8 }, { 285, 8 }, { 293, 8 }, { 301, 8 }, { 309, 8 },
 };
 #define s_metalWheel1HullCount 37
 
@@ -1337,7 +1677,8 @@ public:
 
 static int sampleWheelStack = RegisterSample( "Issues", "GMod Wheel Stack", WheelStack::Create );
 
-// There was a problem where this bouncing box could gain energy. This has been fixed by the deferred restitution update.
+// There was a problem where this bouncing box could gain energy. This has been fixed by the
+// deferred restitution update.
 class RestitutionOvershoot : public Sample
 {
 public:
@@ -1417,9 +1758,9 @@ public:
 		b3Pos markerPoint = { 0.0f, m_dropHeight + m_boxHalf, 0.0f };
 		DrawPlane( b3Vec3_axisY, markerPoint, MakeColor( b3_colorYellow ) );
 
-		// Perfect restitution and no friction, so the total energy may only decrease. It is the honest
-		// invariant here: the height check cannot tell a bounce that gained potential energy from one
-		// that converted it into spin, and this drop does both.
+		// Perfect restitution and no friction, so the total energy may only decrease. It is the
+		// honest invariant here: the height check cannot tell a bounce that gained potential energy
+		// from one that converted it into spin, and this drop does both.
 		MechanicalEnergy energy = MeasureEnergy( m_worldId, &m_boxBody, 1 );
 		float total = energy.Total();
 
@@ -1481,7 +1822,8 @@ public:
 	bool m_energyFailed = false;
 };
 
-static int sampleRestitutionOvershoot = RegisterSample( "Issues", "Restitution Overshoot", RestitutionOvershoot::Create );
+static int sampleRestitutionOvershoot =
+	RegisterSample( "Issues", "Restitution Overshoot", RestitutionOvershoot::Create );
 
 class SlideTwistOffCenterShape : public Sample
 {
@@ -1573,9 +1915,7 @@ public:
 
 static int sampleHugeBox = RegisterSample( "Issues", "Huge Box", HugeBox::Create );
 
-// This demonstrates this cap on mesh complexity. B3_MAX_MESH_CONTACT_TRIANGLES
-// It generates this warning:
-// Box3D: WARNING: complex mesh detected, triangle buffer capacity of 256 reached
+// A tilted cylinder whose bounds cover more than 512 height field triangles
 class HeightfieldIssue : public Sample
 {
 public:
@@ -1662,13 +2002,14 @@ public:
 		// Velocity is zeroed every step, so without this the mover falls asleep on the first one
 		bodyDef.enableSleep = false;
 
-		// A room planner slides items on the floor plane and yaws them to face a wall
-		bodyDef.motionLocks = { false, true, false, true, false, true };
 		m_moverId = b3CreateBody( m_worldId, &bodyDef );
 
 		b3BoxHull mover = b3MakeBoxHull( m_moverHalfExtent, m_moverHalfExtent, m_moverHalfExtent );
 		shapeDef.baseMaterial.friction = 0.0f;
 		b3CreateHullShape( m_moverId, &shapeDef, &mover.base );
+
+		// A room planner slides items on the floor plane and yaws them to face a wall
+		LockMotion( m_moverId, { .linearY = true, .rotation = e_spinY } );
 	}
 
 	void PlaceMover()
@@ -1740,3 +2081,1829 @@ public:
 };
 
 static int sampleThinWallPushOut = RegisterSample( "Issues", "Thin Wall Push Out", ThinWallPushOut::Create );
+
+// Two crates resting on a rolling deck, one each side of the roll axis: the orange crate with
+// contact recycling (the default), the blue crate with it off for its body.
+//
+// A recycled contact keeps the normal and anchors it was made with, fixed in the world, while each
+// body turns less than B3_CONTACT_RECYCLE_ANGULAR_DISTANCE (10 degrees) from where the contact was
+// made and the two stay within the recycle distance (5 cm). Only the separation is updated. A deck
+// and the cargo resting on it turn together, so their contact is recycled through the roll. Its
+// normal stays the deck's up as it was, and its anchors stay at the same world offsets from each
+// body's center of mass, so the orange crate moves as the deck moves at that fixed spot in space,
+// not as the deck under it moves. It goes straight up and down instead of along its arc, and slides
+// out across the deck by about offset * (1 - cos(roll)). While that stays under the recycle
+// distance the crate sways out and back. Past it (8 m and 8 degrees here, 78 mm) the contact is
+// made again partway through, at the deck's angle then, and frozen there, so the crate walks off
+// across the deck roll by roll. The angular tolerance doesn't stop that: at 12 or 15 degrees the
+// contact is made again more often and the crate walks all the same. The blue crate rides with the
+// deck. The slide arrows on the deck are drawn ten times longer.
+//
+// The fix is to disable recycling on the deck, which stops both crates from recycling. The Deck
+// Recycling checkbox turns it back on to show the walk.
+class RollingDeck : public Sample
+{
+public:
+	static constexpr float m_deckHalfLength = 2.0f;
+	static constexpr float m_deckHalfWidth = 10.0f;
+	static constexpr float m_deckHalfThickness = 0.25f;
+	static constexpr float m_crateHalf = 0.5f;
+	static constexpr float m_crateOffset = 8.0f;
+	static constexpr float m_friction = 1.0f;
+	static constexpr float m_settleTime = 1.0f;
+	static constexpr float m_slideScale = 10.0f;
+
+	explicit RollingDeck( SampleContext* context )
+		: Sample( context )
+	{
+		if ( context->restart == false )
+		{
+			m_camera->SetView( 75.0f, 15.0f, 32.0f, { 0.0f, 0.5f, 0.0f } );
+		}
+
+		m_rollDegrees = 8.0f;
+		m_period = 6.0f;
+		m_deckRecycling = false;
+		m_deckId = {};
+		m_crateIds[0] = {};
+		m_crateIds[1] = {};
+
+		CreateScene();
+	}
+
+	void CreateScene()
+	{
+		if ( B3_IS_NON_NULL( m_deckId ) )
+		{
+			b3DestroyBody( m_deckId );
+			b3DestroyBody( m_crateIds[0] );
+			b3DestroyBody( m_crateIds[1] );
+		}
+
+		b3ShapeDef shapeDef = b3DefaultShapeDef();
+		shapeDef.baseMaterial.friction = m_friction;
+
+		// The deck rolls about the world x axis through its center
+		{
+			b3BodyDef bodyDef = b3DefaultBodyDef();
+			bodyDef.type = b3_kinematicBody;
+			bodyDef.enableContactRecycling = m_deckRecycling;
+			m_deckId = b3CreateBody( m_worldId, &bodyDef );
+
+			b3BoxHull box = b3MakeBoxHull( m_deckHalfLength, m_deckHalfThickness, m_deckHalfWidth );
+			shapeDef.baseMaterial.customColor = b3_colorSlateGray;
+			b3CreateHullShape( m_deckId, &shapeDef, &box.base );
+		}
+
+		// The crates rest on the level deck, m_crateOffset either side of the roll axis
+		b3BoxHull box = b3MakeBoxHull( m_crateHalf, m_crateHalf, m_crateHalf );
+		for ( int i = 0; i < 2; ++i )
+		{
+			b3BodyDef bodyDef = b3DefaultBodyDef();
+			bodyDef.type = b3_dynamicBody;
+			bodyDef.position = { 0.0f, m_deckHalfThickness + m_crateHalf, i == 0 ? m_crateOffset : -m_crateOffset };
+
+			// The orange crate recycles its contact with the deck, the blue crate doesn't. Both
+			// stay awake, so a small roll can't put them to sleep.
+			bodyDef.enableContactRecycling = i == 0;
+			bodyDef.enableSleep = false;
+			m_crateIds[i] = b3CreateBody( m_worldId, &bodyDef );
+
+			shapeDef.baseMaterial.customColor = i == 0 ? b3_colorOrange : b3_colorDodgerBlue;
+			b3CreateHullShape( m_crateIds[i], &shapeDef, &box.base );
+
+			m_start[i] = b3Vec3_zero;
+			m_maxSlide[i] = 0.0f;
+			m_maxNormalError[i] = 0.0f;
+		}
+
+		m_time = 0.0f;
+		m_started = false;
+	}
+
+	// The roll angle in radians at a time since the start: still while the crates settle, then
+	// rolling, eased in over the first quarter roll so the crates aren't jolted by a deck starting
+	// at full speed.
+	float RollAngle( float time ) const
+	{
+		float t = time - m_settleTime;
+		if ( t <= 0.0f )
+		{
+			return 0.0f;
+		}
+
+		float ease = 1.0f;
+		if ( t < 0.25f * m_period )
+		{
+			float u = t / ( 0.25f * m_period );
+			ease = u * u * ( 3.0f - 2.0f * u );
+		}
+
+		return ease * m_rollDegrees * B3_PI / 180.0f * sinf( 2.0f * B3_PI * t / m_period );
+	}
+
+	bool DrawControls() override
+	{
+		// Changing the roll starts the scene again, so the contacts are made with the deck level.
+		ImGui::SliderFloat( "Roll (deg)", &m_rollDegrees, 0.0f, 15.0f, "%.1f" );
+		if ( ImGui::IsItemDeactivatedAfterEdit() )
+		{
+			CreateScene();
+		}
+
+		ImGui::SliderFloat( "Period (s)", &m_period, 2.0f, 12.0f, "%.1f" );
+		if ( ImGui::IsItemDeactivatedAfterEdit() )
+		{
+			CreateScene();
+		}
+
+		if ( ImGui::Checkbox( "Deck Recycling", &m_deckRecycling ) )
+		{
+			CreateScene();
+		}
+
+		if ( ImGui::Button( "Reset" ) )
+		{
+			CreateScene();
+		}
+
+		return true;
+	}
+
+	void Step() override
+	{
+		float timeStep = m_context->hertz > 0.0f ? 1.0f / m_context->hertz : 0.0f;
+		if ( m_context->pause && m_context->singleStep == 0 )
+		{
+			timeStep = 0.0f;
+		}
+
+		if ( timeStep > 0.0f )
+		{
+			b3Quat rotation = b3MakeQuatFromAxisAngle( b3Vec3_axisX, RollAngle( m_time + timeStep ) );
+			b3Body_SetTargetTransform( m_deckId, { { 0.0f, 0.0f, 0.0f }, rotation }, timeStep, true );
+		}
+
+		Sample::Step();
+
+		m_time += timeStep;
+
+		// Where the crates settled, in the deck's frame, measured from as the deck starts to roll
+		if ( m_started == false && m_time >= m_settleTime )
+		{
+			for ( int i = 0; i < 2; ++i )
+			{
+				m_start[i] = b3Body_GetLocalPoint( m_deckId, b3Body_GetPosition( m_crateIds[i] ) );
+			}
+			m_started = true;
+		}
+
+		b3Vec3 deckUp = b3Body_GetWorldVector( m_deckId, b3Vec3_axisY );
+		float slide[2] = { 0.0f, 0.0f };
+		float normalError[2] = { 0.0f, 0.0f };
+
+		for ( int i = 0; i < 2; ++i )
+		{
+			Vec4 color = i == 0 ? MakeColor( b3_colorOrange ) : MakeColor( b3_colorDodgerBlue );
+			b3Pos center = b3Body_GetPosition( m_crateIds[i] );
+
+			// The deck's up (white) and the crate's contact normal (in the crate's color), from the
+			// crate's center
+			DrawArrow( center, b3OffsetPos( center, b3MulSV( 2.5f, deckUp ) ), MakeColor( b3_colorWhite ) );
+
+			b3ContactData contactData;
+			if ( b3Body_GetContactData( m_crateIds[i], &contactData, 1 ) == 1 && contactData.manifoldCount > 0 )
+			{
+				b3Vec3 normal = contactData.manifolds[0].normal;
+				if ( b3Dot( normal, deckUp ) < 0.0f )
+				{
+					normal = b3Neg( normal );
+				}
+
+				DrawArrow( center, b3OffsetPos( center, b3MulSV( 2.5f, normal ) ), color );
+				normalError[i] = acosf( b3MinFloat( b3Dot( normal, deckUp ), 1.0f ) ) * 180.0f / B3_PI;
+			}
+
+			DrawString3D( b3OffsetPos( center, b3MulSV( 3.0f, deckUp ) ), color, "%s",
+						  i == 0 ? "recycling on" : "recycling off" );
+
+			if ( m_started == false )
+			{
+				continue;
+			}
+
+			// Where the crate settled, outlined on the deck's top, and how far it has slid from
+			// there across the deck, drawn m_slideScale times longer
+			b3Vec3 local = b3Body_GetLocalPoint( m_deckId, center );
+			b3Vec3 offset = b3Sub( local, m_start[i] );
+			offset.y = 0.0f;
+			slide[i] = b3Length( offset );
+
+			float top = m_deckHalfThickness + 0.01f;
+			b3Vec3 mark = { m_start[i].x, top, m_start[i].z };
+			b3Vec3 corners[4] = {
+				{ mark.x - m_crateHalf, top, mark.z - m_crateHalf },
+				{ mark.x + m_crateHalf, top, mark.z - m_crateHalf },
+				{ mark.x + m_crateHalf, top, mark.z + m_crateHalf },
+				{ mark.x - m_crateHalf, top, mark.z + m_crateHalf },
+			};
+			for ( int j = 0; j < 4; ++j )
+			{
+				DrawLine( b3Body_GetWorldPoint( m_deckId, corners[j] ),
+						  b3Body_GetWorldPoint( m_deckId, corners[( j + 1 ) % 4] ), color );
+			}
+
+			b3Vec3 tip = b3MulAdd( mark, m_slideScale, offset );
+			DrawArrow( b3Body_GetWorldPoint( m_deckId, mark ), b3Body_GetWorldPoint( m_deckId, tip ), color );
+
+			m_maxSlide[i] = b3MaxFloat( m_maxSlide[i], slide[i] );
+			m_maxNormalError[i] = b3MaxFloat( m_maxNormalError[i], normalError[i] );
+		}
+
+		float roll = RollAngle( m_time ) * 180.0f / B3_PI;
+		float expected = m_crateOffset * ( 1.0f - cosf( m_rollDegrees * B3_PI / 180.0f ) );
+
+		DrawTextLine( "deck rolls %.1f deg each way every %.1f s (now %+.1f deg), crates %.0f m "
+					  "from the roll axis, friction %.0f",
+					  m_rollDegrees, m_period, roll, m_crateOffset, m_friction );
+		DrawTextLine( "a contact is recycled while each body turns < 10 deg from where it was made "
+					  "(B3_CONTACT_RECYCLE_ANGULAR_DISTANCE)" );
+		DrawTextLine( "deck recycling %s, contacts recycled this step: %d", m_deckRecycling ? "on" : "off",
+					  b3World_GetCounters( m_worldId ).recycledContactCount );
+		DrawTextLine( "orange, recycling on : normal %4.1f deg off the deck's up (most %4.1f), "
+					  "slid %5.1f mm (most %5.1f)",
+					  normalError[0], m_maxNormalError[0], 1000.0f * slide[0], 1000.0f * m_maxSlide[0] );
+		DrawTextLine( "blue,   recycling off: normal %4.1f deg off the deck's up (most %4.1f), "
+					  "slid %5.1f mm (most %5.1f)",
+					  normalError[1], m_maxNormalError[1], 1000.0f * slide[1], 1000.0f * m_maxSlide[1] );
+		DrawTextLine( "recycled, the crate moves straight up and down: offset * (1 - cos(roll)) = %.1f mm at "
+					  "each end; past the "
+					  "%.0f cm recycle distance the contact is made again tilted and the crate walks off",
+					  1000.0f * expected, 100.0f * b3World_GetContactRecycleDistance( m_worldId ) );
+		DrawTextLine( "arrows: white is the deck's up, colored is the contact normal; slide arrows "
+					  "on the deck are drawn %.0fx",
+					  m_slideScale );
+	}
+
+	static Sample* Create( SampleContext* context )
+	{
+		return new RollingDeck( context );
+	}
+
+	b3BodyId m_deckId;
+	b3BodyId m_crateIds[2];
+	b3Vec3 m_start[2];
+	float m_maxSlide[2];
+	float m_maxNormalError[2];
+	float m_rollDegrees;
+	float m_period;
+	float m_time;
+	bool m_started;
+	bool m_deckRecycling;
+};
+
+static int sampleRollingDeck = RegisterSample( "Issues", "Rolling Deck", RollingDeck::Create );
+
+// Issue #215: two 25 kg boxes resting on a kinematic platform spinning about the vertical axis at a
+// constant rate, one each side of the axis. The orange box recycles its contact with the platform
+// (the default), the blue box has recycling off for its body.
+//
+// The box keeps a constant pose relative to the platform, so its contact is recycled until either
+// body turns past B3_CONTACT_RECYCLE_ANGULAR_DISTANCE (10 degrees). The recycled anchors keep the
+// world orientation they were made with, so friction holds the box to the platform's velocity at a
+// point up to 10 degrees behind on the arc. The orange box spirals outward, about omega * r * sin(5 deg)
+// on average, and the slide grows with the spin rate and the radius. The blue box stays put. Same
+// mechanism as the Rolling Deck sample, about a vertical axis instead of a horizontal one.
+//
+// The fix is to disable recycling on the platform, which stops both boxes from recycling. The
+// Platform Recycling checkbox turns it back on to show the drift.
+class TurningPlatform : public Sample
+{
+public:
+	static constexpr float m_platformHalfLength = 4.0f;
+	static constexpr float m_platformHalfThickness = 0.25f;
+	static constexpr float m_platformHalfWidth = 1.5f;
+	static constexpr float m_boxHalf = 0.25f;
+	static constexpr float m_boxMass = 25.0f;
+	static constexpr float m_settleTime = 1.0f;
+
+	explicit TurningPlatform( SampleContext* context )
+		: Sample( context )
+	{
+		if ( context->restart == false )
+		{
+			m_camera->SetView( 30.0f, 40.0f, 14.0f, { 0.0f, 0.0f, 0.0f } );
+		}
+
+		m_spinRate = 0.12f;
+		m_radius = 1.75f;
+		m_platformRecycling = false;
+		m_platformId = {};
+		m_boxIds[0] = {};
+		m_boxIds[1] = {};
+
+		CreateScene();
+	}
+
+	void CreateScene()
+	{
+		if ( B3_IS_NON_NULL( m_platformId ) )
+		{
+			b3DestroyBody( m_platformId );
+			b3DestroyBody( m_boxIds[0] );
+			b3DestroyBody( m_boxIds[1] );
+		}
+
+		b3Vec3 omega = { 0.0f, m_spinRate, 0.0f };
+
+		{
+			b3BodyDef bodyDef = b3DefaultBodyDef();
+			bodyDef.type = b3_kinematicBody;
+			bodyDef.angularVelocity = omega;
+			bodyDef.enableContactRecycling = m_platformRecycling;
+			m_platformId = b3CreateBody( m_worldId, &bodyDef );
+
+			b3BoxHull box = b3MakeBoxHull( m_platformHalfLength, m_platformHalfThickness, m_platformHalfWidth );
+			b3ShapeDef shapeDef = b3DefaultShapeDef();
+			shapeDef.baseMaterial.customColor = b3_colorSlateGray;
+			b3CreateHullShape( m_platformId, &shapeDef, &box.base );
+		}
+
+		b3BoxHull box = b3MakeBoxHull( m_boxHalf, m_boxHalf, m_boxHalf );
+		b3ShapeDef shapeDef = b3DefaultShapeDef();
+		shapeDef.density = m_boxMass / ( 8.0f * m_boxHalf * m_boxHalf * m_boxHalf );
+
+		for ( int i = 0; i < 2; ++i )
+		{
+			// Start with the platform's surface velocity so there is no initial slip
+			b3Vec3 start = { i == 0 ? -m_radius : m_radius, m_platformHalfThickness + m_boxHalf, 0.0f };
+
+			b3BodyDef bodyDef = b3DefaultBodyDef();
+			bodyDef.type = b3_dynamicBody;
+			bodyDef.position = { start.x, start.y, start.z };
+			bodyDef.linearVelocity = b3Cross( omega, start );
+			bodyDef.angularVelocity = omega;
+			bodyDef.enableContactRecycling = i == 0;
+			bodyDef.enableSleep = false;
+			m_boxIds[i] = b3CreateBody( m_worldId, &bodyDef );
+
+			shapeDef.baseMaterial.customColor = i == 0 ? b3_colorOrange : b3_colorDodgerBlue;
+			b3CreateHullShape( m_boxIds[i], &shapeDef, &box.base );
+
+			m_start[i] = b3Vec3_zero;
+			m_slide[i] = 0.0f;
+		}
+
+		m_time = 0.0f;
+		m_started = false;
+	}
+
+	bool DrawControls() override
+	{
+		ImGui::SliderFloat( "Spin (rad/s)", &m_spinRate, 0.0f, 0.5f, "%.2f" );
+		if ( ImGui::IsItemDeactivatedAfterEdit() )
+		{
+			CreateScene();
+		}
+
+		ImGui::SliderFloat( "Radius (m)", &m_radius, 0.0f, 3.5f, "%.2f" );
+		if ( ImGui::IsItemDeactivatedAfterEdit() )
+		{
+			CreateScene();
+		}
+
+		if ( ImGui::Checkbox( "Platform Recycling", &m_platformRecycling ) )
+		{
+			CreateScene();
+		}
+
+		if ( ImGui::Button( "Reset" ) )
+		{
+			CreateScene();
+		}
+
+		return true;
+	}
+
+	void Step() override
+	{
+		float timeStep = m_context->hertz > 0.0f ? 1.0f / m_context->hertz : 0.0f;
+		if ( m_context->pause && m_context->singleStep == 0 )
+		{
+			timeStep = 0.0f;
+		}
+
+		Sample::Step();
+
+		m_time += timeStep;
+
+		if ( m_started == false && m_time >= m_settleTime )
+		{
+			for ( int i = 0; i < 2; ++i )
+			{
+				m_start[i] = b3Body_GetLocalPoint( m_platformId, b3Body_GetPosition( m_boxIds[i] ) );
+			}
+			m_started = true;
+		}
+
+		float radius[2];
+		for ( int i = 0; i < 2; ++i )
+		{
+			Vec4 color = i == 0 ? MakeColor( b3_colorOrange ) : MakeColor( b3_colorDodgerBlue );
+			b3Pos center = b3Body_GetPosition( m_boxIds[i] );
+			b3Vec3 local = b3Body_GetLocalPoint( m_platformId, center );
+			radius[i] = sqrtf( local.x * local.x + local.z * local.z );
+
+			DrawString3D( b3OffsetPos( center, { 0.0f, 0.75f, 0.0f } ), color, "%s",
+						  i == 0 ? "recycling on" : "recycling off" );
+
+			if ( m_started == false )
+			{
+				continue;
+			}
+
+			b3Vec3 offset = b3Sub( local, m_start[i] );
+			offset.y = 0.0f;
+			m_slide[i] = b3Length( offset );
+
+			// Where the box settled, outlined on the platform's top, and the path back to it
+			float top = m_platformHalfThickness + 0.01f;
+			b3Vec3 mark = { m_start[i].x, top, m_start[i].z };
+			b3Vec3 corners[4] = {
+				{ mark.x - m_boxHalf, top, mark.z - m_boxHalf },
+				{ mark.x + m_boxHalf, top, mark.z - m_boxHalf },
+				{ mark.x + m_boxHalf, top, mark.z + m_boxHalf },
+				{ mark.x - m_boxHalf, top, mark.z + m_boxHalf },
+			};
+			for ( int j = 0; j < 4; ++j )
+			{
+				DrawLine( b3Body_GetWorldPoint( m_platformId, corners[j] ),
+						  b3Body_GetWorldPoint( m_platformId, corners[( j + 1 ) % 4] ), color );
+			}
+
+			b3Vec3 tip = { local.x, top, local.z };
+			DrawArrow( b3Body_GetWorldPoint( m_platformId, mark ), b3Body_GetWorldPoint( m_platformId, tip ), color );
+		}
+
+		float elapsed = b3MaxFloat( m_time - m_settleTime, 0.0f );
+		float expected = m_spinRate * m_radius * sinf( 5.0f * B3_PI / 180.0f );
+
+		DrawTextLine( "platform spins %.2f rad/s, boxes %.2f m from the axis, %.0f s since settling", m_spinRate,
+					  m_radius, elapsed );
+		DrawTextLine( "platform recycling %s, contacts recycled this step: %d", m_platformRecycling ? "on" : "off",
+					  b3World_GetCounters( m_worldId ).recycledContactCount );
+		DrawTextLine( "orange, recycling on : radius %.3f m, slid %6.1f cm", radius[0], 100.0f * m_slide[0] );
+		DrawTextLine( "blue,   recycling off: radius %.3f m, slid %6.1f cm", radius[1], 100.0f * m_slide[1] );
+		DrawTextLine( "predicted outward slip from a 5 deg mean anchor lag: omega * r * sin(5 deg) = %.1f mm/s",
+					  1000.0f * expected );
+	}
+
+	static Sample* Create( SampleContext* context )
+	{
+		return new TurningPlatform( context );
+	}
+
+	b3BodyId m_platformId;
+	b3BodyId m_boxIds[2];
+	b3Vec3 m_start[2];
+	float m_slide[2];
+	float m_spinRate;
+	float m_radius;
+	float m_time;
+	bool m_started;
+	bool m_platformRecycling;
+};
+
+static int sampleTurningPlatform = RegisterSample( "Issues", "Turning Platform", TurningPlatform::Create );
+
+// A car made of one dynamic box (the chassis) and four ray cast 'wheels'.
+// There are no wheel bodies and no joints.
+
+// W/S to drive, A/D to steer and Space to brake. T toggles a camera that follows the car.
+
+// Each step every wheel casts a ray down the chassis' own down axis. Where a ray hits the ground
+// the wheel applies two forces to the chassis at the contact point:
+// - a spring and damper force along the contact normal, which holds the chassis up
+// - a tyre force in the contact plane, which drives, brakes and stops the wheel sliding sideways
+// The tyre force is limited by friction times the spring force, so a wheel that is lightly loaded
+// grips less. Weight transfer, body roll and rollover come from where these forces are applied.
+class RaycastVehicle : public Sample
+{
+public:
+	static constexpr int m_wheelCount = 4;
+	static constexpr uint64_t m_vehicleBit = 0x2;
+
+	struct Wheel
+	{
+		b3Vec3 localMount;
+		bool steered;
+
+		// Distance from the mount down to the wheel's center
+		float suspensionLength;
+		bool grounded;
+
+		// Rotation about the axle, for drawing only
+		float spinAngle;
+		float spinSpeed;
+	};
+
+	explicit RaycastVehicle( SampleContext* context )
+		: Sample( context )
+	{
+		if ( context->restart == false )
+		{
+			m_camera->SetView( 25.0f, 20.0f, 12.0f, { 0.0f, 1.0f, 0.0f } );
+		}
+
+		m_suspensionHertz = 1.5f;
+		m_suspensionDampingRatio = 0.45f;
+		m_friction = 1.0f;
+		m_wheelRadius = 0.35f;
+		m_suspensionTravel = 0.3f;
+		m_engineAcceleration = 5.0f;
+		m_brakeDeceleration = 8.0f;
+		m_maxSteeringAngle = 0.15f * B3_PI;
+		m_steeringAngle = 0.0f;
+
+		AddGroundBox( 100.0f );
+
+		// A ramp to show the suspension working
+		{
+			b3BodyDef bodyDef = b3DefaultBodyDef();
+			bodyDef.position = { 15.0f, -0.5f, 0.0f };
+			bodyDef.rotation = b3MakeQuatFromAxisAngle( b3Vec3_axisZ, 0.1f );
+			b3BodyId bodyId = b3CreateBody( m_worldId, &bodyDef );
+
+			b3ShapeDef shapeDef = b3DefaultShapeDef();
+			b3BoxHull box = b3MakeBoxHull( 6.0f, 0.5f, 4.0f );
+			b3CreateHullShape( bodyId, &shapeDef, &box.base );
+		}
+
+		// The chassis is the only body. Its shape has its own category so the wheel rays can skip
+		// it.
+		float halfLength = 2.2f;
+		float halfHeight = 0.7f;
+		float halfWidth = 0.9f;
+		{
+			b3BodyDef bodyDef = b3DefaultBodyDef();
+			bodyDef.type = b3_dynamicBody;
+			bodyDef.position = { 0.0f, 1.2f, 0.0f };
+			m_chassisId = b3CreateBody( m_worldId, &bodyDef );
+
+			b3ShapeDef shapeDef = b3DefaultShapeDef();
+			shapeDef.density = 130.0f;
+			shapeDef.filter.categoryBits = m_vehicleBit;
+			b3BoxHull box = b3MakeBoxHull( halfLength, halfHeight, halfWidth );
+			b3CreateHullShape( m_chassisId, &shapeDef, &box.base );
+
+			// A car tips over when its lateral acceleration exceeds half the track width divided by
+			// the height of its center of mass. At the middle of this box the center of mass would
+			// be about as high as the half track, and the car would roll before its tyres slide.
+			// Lower it to near the floor, where the heavy parts of a car are.
+			b3MassData massData = b3Body_GetMassData( m_chassisId );
+			massData.center = { 0.0f, -0.45f, 0.0f };
+			b3Body_SetMassData( m_chassisId, massData );
+		}
+
+		// The mounts are the top of each wheel's travel, inside the chassis at the sides. +x is
+		// forward.
+		float axle = 0.75f * halfLength;
+		float mountHeight = -0.3f;
+		m_wheels[0] = { { axle, mountHeight, halfWidth }, true, m_suspensionTravel };
+		m_wheels[1] = { { axle, mountHeight, -halfWidth }, true, m_suspensionTravel };
+		m_wheels[2] = { { -axle, mountHeight, halfWidth }, false, m_suspensionTravel };
+		m_wheels[3] = { { -axle, mountHeight, -halfWidth }, false, m_suspensionTravel };
+
+		// A cylinder along its y axis, centered, for drawing the wheels
+		float wheelWidth = 0.25f;
+		m_wheelHull = b3CreateCylinder( wheelWidth, m_wheelRadius, -0.5f * wheelWidth, 12 );
+	}
+
+	~RaycastVehicle() override
+	{
+		b3DestroyHull( m_wheelHull );
+
+		if ( m_camera->m_thirdPerson )
+		{
+			ToggleThirdPerson();
+		}
+	}
+
+	void Keyboard( int key, int action, int mods ) override
+	{
+		if ( key == KEY_T && action == ACTION_PRESS )
+		{
+			ToggleThirdPerson();
+		}
+	}
+
+	bool DrawControls() override
+	{
+		ImGui::SliderFloat( "Suspension Hertz", &m_suspensionHertz, 0.5f, 5.0f, "%.1f" );
+		ImGui::SliderFloat( "Suspension Damping", &m_suspensionDampingRatio, 0.0f, 2.0f, "%.2f" );
+		ImGui::SliderFloat( "Tyre Friction", &m_friction, 0.0f, 2.0f, "%.2f" );
+
+		bool thirdPerson = m_camera->m_thirdPerson;
+		if ( ImGui::Checkbox( "Third Person (T)", &thirdPerson ) )
+		{
+			ToggleThirdPerson();
+		}
+
+		return true;
+	}
+
+	// Apply the forces of every wheel to the chassis for the coming step
+	void UpdateWheels( float timeStep, float throttle, float brake, float steer )
+	{
+		b3WorldTransform transform = b3Body_GetTransform( m_chassisId );
+		b3Vec3 forward = b3RotateVector( transform.q, b3Vec3_axisX );
+
+		// The acceleration the driver asks for along the chassis' nose. The brake opposes the
+		// chassis' motion and is capped at what stops it this step, so it never drives it
+		// backwards.
+		float speed = b3Dot( b3Body_GetLinearVelocity( m_chassisId ), forward );
+		float acceleration = m_engineAcceleration * throttle;
+		float stopping = b3MinFloat( m_brakeDeceleration * brake, b3AbsFloat( speed ) / timeStep );
+		acceleration -= speed > 0.0f ? stopping : -stopping;
+
+		for ( int i = 0; i < m_wheelCount; ++i )
+		{
+			UpdateWheel( m_wheels[i], transform, timeStep, acceleration, steer );
+		}
+	}
+
+	// Cast one wheel's ray and apply its suspension and tyre forces to the chassis
+	void UpdateWheel( Wheel& wheel, b3WorldTransform transform, float timeStep, float acceleration, float steer )
+	{
+		b3Vec3 up = b3RotateVector( transform.q, b3Vec3_axisY );
+		b3Vec3 forward = b3RotateVector( transform.q, b3Vec3_axisX );
+
+		// The ray reaches from the mount down through the spring's travel and the wheel's radius
+		float reach = m_suspensionTravel + m_wheelRadius;
+		b3Vec3 translation = b3MulSV( -reach, up );
+
+		b3QueryFilter filter = b3DefaultQueryFilter();
+		filter.categoryBits = m_vehicleBit;
+		filter.maskBits = ~m_vehicleBit;
+
+		b3Pos mount = b3TransformWorldPoint( transform, wheel.localMount );
+		b3RayResult hit = b3World_CastRayClosest( m_worldId, mount, translation, filter );
+		wheel.grounded = hit.hit;
+		float fraction = hit.hit ? hit.fraction : 1.0f;
+		wheel.suspensionLength = fraction * reach - m_wheelRadius;
+
+		// A wheel turns at the speed of the ground under it, and keeps that speed in the air
+		wheel.spinAngle = b3UnwindAngle( wheel.spinAngle + wheel.spinSpeed * timeStep );
+
+		if ( hit.hit == false )
+		{
+			return;
+		}
+
+		// Each wheel carries an equal share of the mass. The spring rate gives that share the
+		// requested natural frequency.
+		float share = b3Body_GetMass( m_chassisId ) / m_wheelCount;
+		float omega = 2.0f * B3_PI * m_suspensionHertz;
+		float stiffness = share * omega * omega;
+		float damping = 2.0f * m_suspensionDampingRatio * share * omega;
+
+		// Suspension. A spring only pushes: a negative load would pull the chassis onto the
+		// ground and hold it there through a jump.
+		float compression = ( 1.0f - hit.fraction ) * reach;
+		float compressionSpeed = -b3Dot( b3Body_GetWorldPointVelocity( m_chassisId, mount ), up );
+		float load = b3MaxFloat( stiffness * compression + damping * compressionSpeed, 0.0f );
+		b3Body_ApplyForce( m_chassisId, b3MulSV( load, hit.normal ), hit.point, true );
+
+		// The wheel's rolling direction in the contact plane, and the direction across it
+		b3Vec3 heading = forward;
+		if ( wheel.steered )
+		{
+			heading = b3RotateVector( b3MakeQuatFromAxisAngle( up, steer ), forward );
+		}
+		b3Vec3 rolling = b3Normalize( b3MulAdd( heading, -b3Dot( heading, hit.normal ), hit.normal ) );
+		b3Vec3 lateral = b3Cross( hit.normal, rolling );
+
+		// The lateral force cancels the contact point's sideways sliding in one step. The rolling
+		// force gives this wheel's share of the mass the requested acceleration, resolved onto the
+		// wheel, so a steered wheel puts less of it into the nose direction.
+		b3Vec3 contactVelocity = b3Body_GetWorldPointVelocity( m_chassisId, hit.point );
+		float lateralForce = -share * b3Dot( contactVelocity, lateral ) / timeStep;
+		float rollingForce = share * acceleration * b3Dot( forward, rolling );
+
+		// Rolling forward along +x turns the wheel backwards about its axle, the chassis' +z
+		wheel.spinSpeed = -b3Dot( contactVelocity, rolling ) / m_wheelRadius;
+
+		// Friction circle: the tyre cannot give more than friction times the load on it
+		float maxForce = m_friction * load;
+		float magnitude = sqrtf( lateralForce * lateralForce + rollingForce * rollingForce );
+		if ( magnitude > maxForce )
+		{
+			lateralForce *= maxForce / magnitude;
+			rollingForce *= maxForce / magnitude;
+		}
+
+		b3Vec3 tyreForce = b3Add( b3MulSV( rollingForce, rolling ), b3MulSV( lateralForce, lateral ) );
+		b3Body_ApplyForce( m_chassisId, tyreForce, hit.point, true );
+	}
+
+	void Step() override
+	{
+		float throttle = 0.0f;
+		throttle += IsKeyDown( KEY_W ) ? 1.0f : 0.0f;
+		throttle -= IsKeyDown( KEY_S ) ? 1.0f : 0.0f;
+		float brake = IsKeyDown( KEY_SPACE ) ? 1.0f : 0.0f;
+
+		m_steeringAngle = 0.0f;
+		m_steeringAngle += IsKeyDown( KEY_A ) ? m_maxSteeringAngle : 0.0f;
+		m_steeringAngle -= IsKeyDown( KEY_D ) ? m_maxSteeringAngle : 0.0f;
+
+		// Forces accumulate until the world steps, so apply them only on a step that runs
+		bool stepping = m_context->pause == false || m_context->singleStep > 0;
+		if ( stepping && m_context->hertz > 0.0f )
+		{
+			UpdateWheels( 1.0f / m_context->hertz, throttle, brake, m_steeringAngle );
+		}
+
+		if ( m_camera->m_thirdPerson )
+		{
+			m_camera->m_pivot = b3Body_GetPosition( m_chassisId );
+			m_camera->UpdateTransform();
+		}
+
+		Sample::Step();
+	}
+
+	void Render() override
+	{
+		Sample::Render();
+
+		b3WorldTransform transform = b3Body_GetTransform( m_chassisId );
+		b3Vec3 down = b3RotateVector( transform.q, b3Neg( b3Vec3_axisY ) );
+
+		// The wheel cylinder is along y. This turns it onto the axle, the chassis' z.
+		b3Quat cylinderToAxle = b3MakeQuatFromAxisAngle( b3Vec3_axisX, 0.5f * B3_PI );
+
+		for ( int i = 0; i < m_wheelCount; ++i )
+		{
+			const Wheel& wheel = m_wheels[i];
+			b3Pos mount = b3TransformWorldPoint( transform, wheel.localMount );
+			b3Pos center = b3OffsetPos( mount, b3MulSV( wheel.suspensionLength, down ) );
+
+			float steer = wheel.steered ? m_steeringAngle : 0.0f;
+			b3Quat q = b3MulQuat( transform.q, b3MakeQuatFromAxisAngle( b3Vec3_axisY, steer ) );
+			q = b3MulQuat( q, b3MakeQuatFromAxisAngle( b3Vec3_axisZ, wheel.spinAngle ) );
+			q = b3MulQuat( q, cylinderToAxle );
+
+			b3HexColor color = wheel.grounded ? b3_colorGreen : b3_colorRed;
+			DrawLine( mount, center, MakeColor( color ) );
+			DrawHull( { center, q }, m_wheelHull, MakeColor( b3_colorGray ) );
+		}
+
+		b3Vec3 forward = b3RotateVector( b3Body_GetRotation( m_chassisId ), b3Vec3_axisX );
+		float speed = b3Dot( b3Body_GetLinearVelocity( m_chassisId ), forward );
+		DrawTextLine( "speed = %.1f m/s", speed );
+	}
+
+	static Sample* Create( SampleContext* context )
+	{
+		return new RaycastVehicle( context );
+	}
+
+	b3BodyId m_chassisId;
+	Wheel m_wheels[m_wheelCount];
+	b3HullData* m_wheelHull;
+
+	float m_suspensionHertz;
+	float m_suspensionDampingRatio;
+	float m_friction;
+	float m_wheelRadius;
+	float m_suspensionTravel;
+	float m_engineAcceleration;
+	float m_brakeDeceleration;
+	float m_maxSteeringAngle;
+	float m_steeringAngle;
+};
+
+static int sampleRaycastVehicle = RegisterSample( "Vehicle", "Raycast Vehicle", RaycastVehicle::Create );
+
+// A user wants the load on a static body C when a box A lands on it, sometimes through a thin sleeping
+// plate B. Hit events report approach speed, and a resting plate has none against C, so C gets no hit
+// event when B is in the middle. Summing the contact impulses on C each step gives the load either way.
+class StaticLoad : public Sample
+{
+public:
+	static constexpr float m_boxHalf = 1.0f;
+	static constexpr float m_tableTop = 3.0f;
+	static constexpr float m_dropX = 1.5f;
+	static constexpr int m_settleSteps = 10;
+	static constexpr int m_historyCapacity = 240;
+	static constexpr int m_maxHits = 12;
+
+	explicit StaticLoad( SampleContext* context )
+		: Sample( context )
+	{
+		if ( context->restart == false )
+		{
+			m_camera->SetView( 20.0f, 15.0f, 22.0f, { 0.0f, 5.0f, 0.0f } );
+		}
+
+		// The weld to the wall lives in game code, so Box3D only sees two static bodies
+		{
+			b3BodyDef bodyDef = b3DefaultBodyDef();
+			bodyDef.name = "wall";
+			bodyDef.position = { -4.25f, 4.0f, 0.0f };
+			b3BodyId wallId = b3CreateBody( m_worldId, &bodyDef );
+
+			b3BoxHull box = b3MakeBoxHull( 0.25f, 4.0f, 3.0f );
+			b3ShapeDef shapeDef = b3DefaultShapeDef();
+			b3CreateHullShape( wallId, &shapeDef, &box.base );
+		}
+
+		{
+			b3BodyDef bodyDef = b3DefaultBodyDef();
+			bodyDef.name = "C";
+			bodyDef.position = { 0.0f, m_tableTop - 1.0f, 0.0f };
+			m_bodyC = b3CreateBody( m_worldId, &bodyDef );
+
+			b3BoxHull box = b3MakeBoxHull( 4.0f, 1.0f, 2.0f );
+			b3ShapeDef shapeDef = b3DefaultShapeDef();
+			shapeDef.enableHitEvents = true;
+			m_shapeC = b3CreateHullShape( m_bodyC, &shapeDef, &box.base );
+		}
+
+		Reset();
+	}
+
+	void Reset()
+	{
+		if ( B3_IS_NON_NULL( m_bodyA ) )
+		{
+			b3DestroyBody( m_bodyA );
+		}
+
+		if ( B3_IS_NON_NULL( m_bodyB ) )
+		{
+			b3DestroyBody( m_bodyB );
+		}
+
+		m_bodyA = b3_nullBodyId;
+		m_bodyB = b3_nullBodyId;
+		m_shapeA = b3_nullShapeId;
+		m_shapeB = b3_nullShapeId;
+
+		m_resetStep = m_stepCount;
+		m_lastStep = m_stepCount;
+		m_dropped = false;
+		m_massA = 0.0f;
+		m_massB = 0.0f;
+		m_impactStep = -1;
+		m_impactSpeed = 0.0f;
+		m_excessImpulse = 0.0f;
+		m_stepImpulseC = 0.0f;
+		m_stepImpulseAB = 0.0f;
+		m_stepImpulseAC = 0.0f;
+		m_stepImpulseBC = 0.0f;
+		m_peakForceC = 0.0f;
+		m_peakForceAB = 0.0f;
+		m_peakForceAC = 0.0f;
+		m_peakForceBC = 0.0f;
+		m_peakStep = -1;
+		m_hitCountC = 0;
+		m_hitCountB = 0;
+		m_hitCount = 0;
+		m_historyCount = 0;
+		m_historyIndex = 0;
+
+		if ( m_includeB )
+		{
+			b3BodyDef bodyDef = b3DefaultBodyDef();
+			bodyDef.type = b3_dynamicBody;
+			bodyDef.name = "B";
+			bodyDef.position = { m_dropX, m_tableTop + m_plateHalfHeight, 0.0f };
+			m_bodyB = b3CreateBody( m_worldId, &bodyDef );
+
+			b3BoxHull box = b3MakeBoxHull( 1.5f, m_plateHalfHeight, 1.0f );
+			b3ShapeDef shapeDef = b3DefaultShapeDef();
+			shapeDef.density = m_densityB;
+			shapeDef.enableHitEvents = true;
+			m_shapeB = b3CreateHullShape( m_bodyB, &shapeDef, &box.base );
+		}
+		else
+		{
+			DropA();
+		}
+	}
+
+	// B rests on C long enough to build its contact, then sleeps the way a settled game object would
+	void DropA()
+	{
+		float baseY = m_tableTop;
+		if ( m_includeB )
+		{
+			if ( m_sleepB )
+			{
+				b3Body_SetAwake( m_bodyB, false );
+			}
+
+			baseY += 2.0f * m_plateHalfHeight;
+		}
+
+		b3BodyDef bodyDef = b3DefaultBodyDef();
+		bodyDef.type = b3_dynamicBody;
+		bodyDef.name = "A";
+		bodyDef.position = { m_dropX, baseY + m_dropHeight + m_boxHalf, 0.0f };
+		m_bodyA = b3CreateBody( m_worldId, &bodyDef );
+
+		b3BoxHull box = b3MakeBoxHull( m_boxHalf, m_boxHalf, m_boxHalf );
+		b3ShapeDef shapeDef = b3DefaultShapeDef();
+		shapeDef.density = m_densityA;
+		shapeDef.enableHitEvents = true;
+		m_shapeA = b3CreateHullShape( m_bodyA, &shapeDef, &box.base );
+
+		m_massA = b3Body_GetMass( m_bodyA );
+		m_massB = m_includeB ? b3Body_GetMass( m_bodyB ) : 0.0f;
+		m_dropped = true;
+	}
+
+	const char* Label( b3ShapeId shapeId ) const
+	{
+		if ( B3_ID_EQUALS( shapeId, m_shapeA ) )
+		{
+			return "A";
+		}
+
+		if ( B3_ID_EQUALS( shapeId, m_shapeB ) )
+		{
+			return "B";
+		}
+
+		if ( B3_ID_EQUALS( shapeId, m_shapeC ) )
+		{
+			return "C";
+		}
+
+		return "?";
+	}
+
+	// Total normal impulse a contact applied over the step, sub-steps and restitution included.
+	// A speculative point that never pushed contributes zero.
+	static float ContactImpulse( const b3ContactData& data )
+	{
+		float impulse = 0.0f;
+		for ( int i = 0; i < data.manifoldCount; ++i )
+		{
+			const b3Manifold& manifold = data.manifolds[i];
+			for ( int j = 0; j < manifold.pointCount; ++j )
+			{
+				impulse += manifold.points[j].totalNormalImpulse;
+			}
+		}
+
+		return impulse;
+	}
+
+	// Sum the impulse on a shape from every touching contact, or only the one against a given shape
+	float ShapeImpulse( b3ShapeId shapeId, b3ShapeId otherId, bool drawArrows )
+	{
+		if ( B3_IS_NULL( shapeId ) )
+		{
+			return 0.0f;
+		}
+
+		int capacity = b3Shape_GetContactCapacity( shapeId );
+		m_contactData.resize( capacity );
+		int count = b3Shape_GetContactData( shapeId, m_contactData.data(), capacity );
+
+		float hertz = m_context->hertz;
+		float arrowScale = m_restingWeight > 0.0f ? 1.0f / m_restingWeight : 0.0f;
+
+		float impulse = 0.0f;
+		for ( int i = 0; i < count; ++i )
+		{
+			const b3ContactData& data = m_contactData[i];
+			bool isShapeA = B3_ID_EQUALS( data.shapeIdA, shapeId );
+			b3ShapeId other = isShapeA ? data.shapeIdB : data.shapeIdA;
+			if ( B3_IS_NON_NULL( otherId ) && B3_ID_EQUALS( other, otherId ) == false )
+			{
+				continue;
+			}
+
+			impulse += ContactImpulse( data );
+
+			if ( drawArrows == false )
+			{
+				continue;
+			}
+
+			// The normal points from shape A to shape B, so it pushes on B and pulls on A
+			b3Pos center = b3Body_GetWorldCenter( b3Shape_GetBody( data.shapeIdA ) );
+			for ( int j = 0; j < data.manifoldCount; ++j )
+			{
+				const b3Manifold& manifold = data.manifolds[j];
+				b3Vec3 direction = isShapeA ? -manifold.normal : manifold.normal;
+				for ( int k = 0; k < manifold.pointCount; ++k )
+				{
+					const b3ManifoldPoint& mp = manifold.points[k];
+					if ( mp.totalNormalImpulse <= 0.0f )
+					{
+						continue;
+					}
+
+					// One meter per resting weight, clamped so an impact spike stays on screen
+					float length = b3MinFloat( mp.totalNormalImpulse * hertz * arrowScale, 4.0f );
+					b3Pos p = b3OffsetPos( center, mp.anchorA );
+					DrawArrow( b3OffsetPos( p, -length * direction ), p, MakeColor( b3_colorRed ) );
+				}
+			}
+		}
+
+		return impulse;
+	}
+
+	void Step() override
+	{
+		b3Vec3 velocityA = B3_IS_NON_NULL( m_bodyA ) ? b3Body_GetLinearVelocity( m_bodyA ) : b3Vec3_zero;
+
+		Sample::Step();
+
+		float gravity = -b3World_GetGravity( m_worldId ).y;
+		m_restingWeight = ( m_massA + m_massB ) * gravity;
+
+		// A thin B leaves A within speculative reach of C, so part of the load can skip B entirely
+		m_stepImpulseC = ShapeImpulse( m_shapeC, b3_nullShapeId, true );
+		m_stepImpulseAC = ShapeImpulse( m_shapeC, m_shapeA, false );
+		m_stepImpulseBC = ShapeImpulse( m_shapeC, m_shapeB, false );
+		m_stepImpulseAB = ShapeImpulse( m_shapeA, m_shapeB, false );
+		float impulseA = ShapeImpulse( m_shapeA, b3_nullShapeId, false );
+
+		// Pausing keeps the last step's events, so only consume a step once
+		if ( m_stepCount != m_lastStep )
+		{
+			m_lastStep = m_stepCount;
+			ProcessStep( impulseA, velocityA );
+		}
+
+		DrawHits();
+		DrawStats();
+	}
+
+	void ProcessStep( float impulseA, b3Vec3 velocityA )
+	{
+		if ( m_dropped == false )
+		{
+			if ( m_stepCount - m_resetStep >= m_settleSteps )
+			{
+				DropA();
+			}
+			return;
+		}
+
+		float hertz = m_context->hertz;
+		float timeStep = hertz > 0.0f ? 1.0f / hertz : 0.0f;
+
+		if ( m_impactStep < 0 && impulseA > 0.0f )
+		{
+			m_impactStep = m_stepCount;
+			m_impactSpeed = -velocityA.y;
+
+			if ( m_pauseOnImpact )
+			{
+				m_context->pause = true;
+			}
+		}
+
+		// From impact on, the impulse on C beyond the resting weight removes the momentum A brought in
+		if ( m_impactStep >= 0 )
+		{
+			m_excessImpulse += m_stepImpulseC - m_restingWeight * timeStep;
+		}
+
+		float forceC = m_stepImpulseC * hertz;
+		float forceAB = m_stepImpulseAB * hertz;
+		if ( forceC > m_peakForceC )
+		{
+			m_peakForceC = forceC;
+			m_peakStep = m_stepCount;
+		}
+
+		m_peakForceAB = b3MaxFloat( m_peakForceAB, forceAB );
+		m_peakForceAC = b3MaxFloat( m_peakForceAC, m_stepImpulseAC * hertz );
+		m_peakForceBC = b3MaxFloat( m_peakForceBC, m_stepImpulseBC * hertz );
+
+		m_historyC[m_historyIndex] = forceC;
+		m_historyAB[m_historyIndex] = forceAB;
+		m_historyIndex = ( m_historyIndex + 1 ) % m_historyCapacity;
+		m_historyCount = b3MinInt( m_historyCount + 1, m_historyCapacity );
+
+		b3ContactEvents events = b3World_GetContactEvents( m_worldId );
+		for ( int i = 0; i < events.hitCount; ++i )
+		{
+			const b3ContactHitEvent& event = events.hitEvents[i];
+			bool touchesC = B3_ID_EQUALS( event.shapeIdA, m_shapeC ) || B3_ID_EQUALS( event.shapeIdB, m_shapeC );
+			bool touchesB = B3_ID_EQUALS( event.shapeIdA, m_shapeB ) || B3_ID_EQUALS( event.shapeIdB, m_shapeB );
+			m_hitCountC += touchesC ? 1 : 0;
+			m_hitCountB += touchesB ? 1 : 0;
+
+			HitRecord record = {};
+			record.event = event;
+			record.step = m_stepCount;
+			if ( b3Contact_IsValid( event.contactId ) )
+			{
+				record.impulse = ContactImpulse( b3Contact_GetData( event.contactId ) );
+			}
+
+			// Newest first, dropping the oldest when full
+			int count = b3MinInt( m_hitCount, m_maxHits - 1 );
+			for ( int j = count; j > 0; --j )
+			{
+				m_hits[j] = m_hits[j - 1];
+			}
+
+			m_hits[0] = record;
+			m_hitCount = count + 1;
+		}
+	}
+
+	void DrawHits()
+	{
+		for ( int i = 0; i < m_hitCount; ++i )
+		{
+			const b3ContactHitEvent& event = m_hits[i].event;
+			b3Pos p1 = event.point;
+			b3Pos p2 = b3OffsetPos( p1, -event.approachSpeed * event.normal );
+			DrawPoint( p1, 10.0f, MakeColor( b3_colorYellow ) );
+			DrawLine( p1, p2, MakeColor( b3_colorYellow ) );
+			DrawString3D( p1, MakeColor( b3_colorWhite ), "%s-%s %.1f m/s", Label( event.shapeIdA ),
+						  Label( event.shapeIdB ), event.approachSpeed );
+		}
+	}
+
+	void DrawStats()
+	{
+		float hertz = m_context->hertz;
+
+		if ( m_dropped == false )
+		{
+			DrawTextLine( "B settling on C" );
+			return;
+		}
+
+		DrawTextLine( "mass A = %.2f kg, mass B = %.2f kg, resting weight on C = %.1f N", m_massA, m_massB,
+					  m_restingWeight );
+
+		if ( m_includeB )
+		{
+			DrawTextLine( "B is %s", b3Body_IsAwake( m_bodyB ) ? "awake" : "asleep" );
+		}
+
+		if ( m_impactStep < 0 )
+		{
+			DrawTextLine( "A falling" );
+			return;
+		}
+
+		float momentum = m_massA * m_impactSpeed;
+		DrawTextLine( "impact at step %d, speed %.2f m/s, momentum %.1f N*s", m_impactStep - m_resetStep, m_impactSpeed,
+					  momentum );
+
+		// No continuous collision between dynamic bodies, so A can sink a full step of travel into B before
+		// they get a contact. If that reaches within speculative distance of C, A loads C directly.
+		if ( m_includeB )
+		{
+			DrawTextLine( "A travels %.2f m per step, B is %.2f m thick", m_impactSpeed / hertz,
+						  2.0f * m_plateHalfHeight );
+		}
+		DrawTextLine( "step load on C = %.1f N (impulse %.3f N*s)", m_stepImpulseC * hertz, m_stepImpulseC );
+		DrawTextLine( "peak load on C = %.1f N at step %d, %.1fx resting weight", m_peakForceC,
+					  m_peakStep - m_resetStep, m_restingWeight > 0.0f ? m_peakForceC / m_restingWeight : 0.0f );
+
+		if ( m_includeB )
+		{
+			DrawTextLine( "  from B = %.1f N, peak %.1f N", m_stepImpulseBC * hertz, m_peakForceBC );
+			DrawTextLine( "  from A directly = %.1f N, peak %.1f N", m_stepImpulseAC * hertz, m_peakForceAC );
+			DrawTextLine( "load A on B = %.1f N, peak %.1f N", m_stepImpulseAB * hertz, m_peakForceAB );
+		}
+
+		DrawTextLine( "impulse on C beyond resting weight = %.1f N*s (A brought %.1f N*s)", m_excessImpulse, momentum );
+		DrawTextLine( "hit events touching C = %d, touching B = %d", m_hitCountC, m_hitCountB );
+
+		for ( int i = 0; i < m_hitCount; ++i )
+		{
+			const HitRecord& record = m_hits[i];
+			DrawTextLine( "  step %d: %s-%s approach %.2f m/s, contact impulse %.3f N*s", record.step - m_resetStep,
+						  Label( record.event.shapeIdA ), Label( record.event.shapeIdB ), record.event.approachSpeed,
+						  record.impulse );
+		}
+	}
+
+	bool DrawControls() override
+	{
+		bool reset = false;
+		reset |= ImGui::Checkbox( "Include B", &m_includeB );
+		reset |= ImGui::Checkbox( "B Asleep", &m_sleepB );
+		reset |= ImGui::SliderFloat( "B Half Thickness", &m_plateHalfHeight, 0.02f, 0.5f, "%.2f m" );
+		reset |= ImGui::SliderFloat( "B Density", &m_densityB, 100.0f, 10000.0f, "%.0f kg/m^3",
+									 ImGuiSliderFlags_Logarithmic );
+		reset |= ImGui::SliderFloat( "A Density", &m_densityA, 100.0f, 10000.0f, "%.0f kg/m^3",
+									 ImGuiSliderFlags_Logarithmic );
+		reset |= ImGui::SliderFloat( "Drop Height", &m_dropHeight, 0.0f, 10.0f, "%.1f m" );
+
+		float threshold = b3World_GetHitEventThreshold( m_worldId );
+		if ( ImGui::SliderFloat( "Hit Threshold", &threshold, 0.0f, 5.0f, "%.2f m/s" ) )
+		{
+			b3World_SetHitEventThreshold( m_worldId, threshold );
+		}
+
+		ImGui::Checkbox( "Pause On Impact", &m_pauseOnImpact );
+
+		if ( ImGui::Button( "Drop Again" ) )
+		{
+			reset = true;
+		}
+
+		if ( reset )
+		{
+			Reset();
+		}
+
+		int offset = m_historyCount < m_historyCapacity ? 0 : m_historyIndex;
+		ImGui::PlotLines( "##loadC", m_historyC, m_historyCount, offset, "load on C (N)", 0.0f, FLT_MAX,
+						  ImVec2( 0.0f, 80.0f ) );
+		ImGui::PlotLines( "##loadAB", m_historyAB, m_historyCount, offset, "load A on B (N)", 0.0f, FLT_MAX,
+						  ImVec2( 0.0f, 80.0f ) );
+
+		return true;
+	}
+
+	static Sample* Create( SampleContext* context )
+	{
+		return new StaticLoad( context );
+	}
+
+	struct HitRecord
+	{
+		b3ContactHitEvent event;
+		float impulse;
+		int step;
+	};
+
+	std::vector<b3ContactData> m_contactData;
+
+	b3BodyId m_bodyA = {};
+	b3BodyId m_bodyB = {};
+	b3BodyId m_bodyC = {};
+	b3ShapeId m_shapeA = {};
+	b3ShapeId m_shapeB = {};
+	b3ShapeId m_shapeC = {};
+
+	HitRecord m_hits[m_maxHits] = {};
+	float m_historyC[m_historyCapacity] = {};
+	float m_historyAB[m_historyCapacity] = {};
+
+	float m_dropHeight = 3.0f;
+	float m_plateHalfHeight = 0.15f;
+	float m_densityA = 1000.0f;
+	float m_densityB = 1000.0f;
+	float m_massA = 0.0f;
+	float m_massB = 0.0f;
+	float m_restingWeight = 0.0f;
+	float m_impactSpeed = 0.0f;
+	float m_excessImpulse = 0.0f;
+	float m_stepImpulseC = 0.0f;
+	float m_stepImpulseAB = 0.0f;
+	float m_stepImpulseAC = 0.0f;
+	float m_stepImpulseBC = 0.0f;
+	float m_peakForceC = 0.0f;
+	float m_peakForceAB = 0.0f;
+	float m_peakForceAC = 0.0f;
+	float m_peakForceBC = 0.0f;
+
+	int m_resetStep = 0;
+	int m_lastStep = 0;
+	int m_impactStep = -1;
+	int m_peakStep = -1;
+	int m_hitCountC = 0;
+	int m_hitCountB = 0;
+	int m_hitCount = 0;
+	int m_historyCount = 0;
+	int m_historyIndex = 0;
+
+	bool m_includeB = true;
+	bool m_sleepB = true;
+	bool m_pauseOnImpact = false;
+	bool m_dropped = false;
+};
+
+static int sampleStaticLoad = RegisterSample( "Issues", "Static Load", StaticLoad::Create );
+
+class TranslationLockedPlatform : public Sample
+{
+public:
+	explicit TranslationLockedPlatform( SampleContext* context )
+		: Sample( context )
+	{
+		if ( context->restart == false )
+		{
+			m_camera->SetView( 0.0f, 10.0f, 10.0f, { 0.0f, 0.5f, 0.0f } );
+		}
+
+		context->hertz = 50.0f;
+		context->subStepCount = 4;
+		b3World_SetGravity( m_worldId, { 0.0f, -20.0f, 0.0f } );
+
+		AddGroundBox( 20.0f );
+
+		b3ShapeDef shapeDef = b3DefaultShapeDef();
+		shapeDef.density = 2.5f;
+		b3BoxHull box = b3MakeBoxHull( 2.0f, m_platformHalfHeight, 0.5f );
+		b3Sphere sphere = { b3Vec3_zero, m_radius };
+
+		for ( int i = 0; i < 2; ++i )
+		{
+			float x = i == 0 ? -3.0f : 3.0f;
+			b3BodyDef platformDef = b3DefaultBodyDef();
+			platformDef.type = i == 0 ? b3_staticBody : b3_dynamicBody;
+			platformDef.position = { x, m_platformY, 0.0f };
+			platformDef.gravityScale = 0.0f;
+			platformDef.enableSleep = false;
+			b3BodyId platformId = b3CreateBody( m_worldId, &platformDef );
+			b3CreateHullShape( platformId, &shapeDef, &box.base );
+
+			if ( platformDef.type == b3_dynamicBody )
+			{
+				LockMotion( platformId, {
+											.linearX = true,
+											.linearY = true,
+											.linearZ = true,
+											.rotation = e_spinZ,
+										} );
+			}
+
+			b3BodyDef bodyDef = b3DefaultBodyDef();
+			bodyDef.type = b3_dynamicBody;
+			bodyDef.position = { x, m_platformY + m_platformHalfHeight + m_radius + 0.1f, 0.0f };
+			bodyDef.enableSleep = false;
+			m_spheres[i] = b3CreateBody( m_worldId, &bodyDef );
+			b3CreateSphereShape( m_spheres[i], &shapeDef, &sphere );
+
+			b3MassData massData = b3Body_GetMassData( m_spheres[i] );
+			massData.inertia = b3MulSM( 10.0f / massData.mass, massData.inertia );
+			massData.mass = 10.0f;
+			b3Body_SetMassData( m_spheres[i], massData );
+		}
+	}
+
+	void Render() override
+	{
+		DrawTextLine( "10 kg spheres dropped onto 0.1 m thick platforms." );
+		DrawTextLine( "Right platform: 1 kg, translation locked, rotation about Z free." );
+		DrawTextLine( "Expected: both gaps settle near zero. Negative means penetration." );
+		DrawTextLine( "Left  (static): gap = %.3f m", GetGap( 0 ) );
+		DrawTextLine( "Right (locked): gap = %.3f m", GetGap( 1 ) );
+	}
+
+	float GetGap( int index )
+	{
+		float restY = m_platformY + m_platformHalfHeight + m_radius;
+		return (float)b3Body_GetPosition( m_spheres[index] ).y - restY;
+	}
+
+	static Sample* Create( SampleContext* context )
+	{
+		return new TranslationLockedPlatform( context );
+	}
+
+	static constexpr float m_platformY = 2.0f;
+	static constexpr float m_platformHalfHeight = 0.05f;
+	static constexpr float m_radius = 0.5f;
+
+	b3BodyId m_spheres[2];
+};
+
+static int sampleTranslationLockedPlatform =
+	RegisterSample( "Issues", "Translation Locked Platform", TranslationLockedPlatform::Create );
+
+// Issue #219: a small bullet sphere fired into a thin static plate at high speed must stay on the
+// approach side. A soft contact only removes about 95 percent of the approach speed in the first
+// substep, enough to carry a 1 cm sphere through a 2.5 cm plate. So time of impact stops rounded
+// shapes touching, and on the next step shallow overlap on the impacting body reads as a tiny
+// positive separation, which the solver handles as a rigid speculative contact. The near plate is a
+// hull, the far plate a mesh. A sphere marked red has crossed its plate.
+class BulletThinPlate : public Sample
+{
+public:
+	static constexpr float m_plateY = 1.0f;
+	static constexpr float m_plateHalfThickness = 0.0125f;
+	static constexpr float m_plateHalfLength = 5.0f;
+	static constexpr float m_plateHalfWidth = 0.5f;
+	static constexpr float m_dropHeight = 2.0f;
+	static constexpr int m_fireInterval = 60;
+
+	explicit BulletThinPlate( SampleContext* context )
+		: Sample( context )
+	{
+		if ( context->restart == false )
+		{
+			m_camera->SetView( 30.0f, 20.0f, 6.0f, { 0.0f, m_plateY, 0.0f } );
+		}
+
+		b3ShapeDef shapeDef = b3DefaultShapeDef();
+		shapeDef.baseMaterial.friction = 0.0f;
+
+		b3BodyDef bodyDef = b3DefaultBodyDef();
+		bodyDef.name = "hull plate";
+		bodyDef.position = { 0.0f, m_plateY, -1.0f };
+		b3BodyId hullPlateId = b3CreateBody( m_worldId, &bodyDef );
+
+		// Top face at the body origin
+		b3Transform offset = b3Transform_identity;
+		offset.p.y = -m_plateHalfThickness;
+		b3BoxHull hull = b3MakeTransformedBoxHull( m_plateHalfLength, m_plateHalfThickness, m_plateHalfWidth, offset );
+		b3CreateHullShape( hullPlateId, &shapeDef, &hull.base );
+
+		bodyDef.name = "mesh plate";
+		bodyDef.position = { 0.0f, m_plateY, 1.0f };
+		b3BodyId meshPlateId = b3CreateBody( m_worldId, &bodyDef );
+
+		m_mesh = b3CreateBoxMesh( { 0.0f, -m_plateHalfThickness, 0.0f },
+								  { m_plateHalfLength, m_plateHalfThickness, m_plateHalfWidth }, true );
+		b3CreateMeshShape( meshPlateId, &shapeDef, m_mesh, b3Vec3_one );
+
+		for ( int i = 0; i < 2; ++i )
+		{
+			m_bulletIds[i] = b3_nullBodyId;
+			m_shotCount[i] = 0;
+			m_crossCount[i] = 0;
+			m_crossed[i] = false;
+		}
+
+		Fire();
+	}
+
+	~BulletThinPlate() override
+	{
+		b3DestroyMesh( m_mesh );
+	}
+
+	void Fire()
+	{
+		b3ShapeDef shapeDef = b3DefaultShapeDef();
+		shapeDef.baseMaterial.friction = 0.0f;
+
+		b3BodyDef bodyDef = b3DefaultBodyDef();
+		bodyDef.type = b3_dynamicBody;
+		bodyDef.isBullet = true;
+		bodyDef.enableSleep = false;
+		bodyDef.linearVelocity = { m_lateralSpeed, -m_speed, 0.0f };
+
+		b3Sphere sphere = { b3Vec3_zero, m_radius };
+
+		for ( int i = 0; i < 2; ++i )
+		{
+			if ( B3_IS_NON_NULL( m_bulletIds[i] ) )
+			{
+				b3DestroyBody( m_bulletIds[i] );
+			}
+
+			bodyDef.position = { -m_plateHalfLength + 1.0f, m_plateY + m_dropHeight, i == 0 ? -1.0f : 1.0f };
+			m_bulletIds[i] = b3CreateBody( m_worldId, &bodyDef );
+			b3CreateSphereShape( m_bulletIds[i], &shapeDef, &sphere );
+
+			m_shotCount[i] += 1;
+			m_crossed[i] = false;
+		}
+
+		m_firedRadius = m_radius;
+		m_stepsSinceFire = 0;
+	}
+
+	bool DrawControls() override
+	{
+		ImGui::PushItemWidth( 6.0f * ImGui::GetFontSize() );
+
+		ImGui::SliderFloat( "Radius", &m_radius, 0.005f, 0.1f, "%.3f m" );
+		ImGui::SliderFloat( "Speed", &m_speed, 10.0f, 1000.0f, "%.0f m/s" );
+		ImGui::SliderFloat( "Lateral", &m_lateralSpeed, 0.0f, 100.0f, "%.0f m/s" );
+		ImGui::Checkbox( "Auto Fire", &m_autoFire );
+
+		if ( ImGui::Button( "Fire" ) )
+		{
+			Fire();
+		}
+
+		ImGui::SameLine();
+		if ( ImGui::Button( "Clear Counts" ) )
+		{
+			for ( int i = 0; i < 2; ++i )
+			{
+				m_shotCount[i] = 0;
+				m_crossCount[i] = 0;
+			}
+		}
+
+		ImGui::PopItemWidth();
+		return true;
+	}
+
+	void Step() override
+	{
+		Sample::Step();
+
+		if ( m_didStep == false )
+		{
+			return;
+		}
+
+		float plateBottom = m_plateY - 2.0f * m_plateHalfThickness;
+		for ( int i = 0; i < 2; ++i )
+		{
+			float y = (float)b3Body_GetPosition( m_bulletIds[i] ).y;
+
+			// A sphere that slid off the far end falls past the plate legitimately
+			float x = (float)b3Body_GetPosition( m_bulletIds[i] ).x;
+			if ( m_crossed[i] == false && x < m_plateHalfLength && y + m_firedRadius < plateBottom )
+			{
+				m_crossed[i] = true;
+				m_crossCount[i] += 1;
+			}
+		}
+
+		m_stepsSinceFire += 1;
+		if ( m_autoFire && m_stepsSinceFire >= m_fireInterval )
+		{
+			Fire();
+		}
+	}
+
+	void Render() override
+	{
+		const char* names[2] = { "hull", "mesh" };
+		for ( int i = 0; i < 2; ++i )
+		{
+			b3Pos p = b3Body_GetPosition( m_bulletIds[i] );
+			DrawPoint( p, 10.0f, MakeColor( m_crossed[i] ? b3_colorRed : b3_colorLime ) );
+
+			DrawTextLine( "%s plate: %s, crossed %d of %d shots", names[i], m_crossed[i] ? "CROSSED" : "ok", m_crossCount[i],
+						  m_shotCount[i] );
+		}
+
+		float substepTime = 1.0f / ( m_context->hertz * m_context->subStepCount );
+		DrawTextLine( "plate thickness %.3f m, travel per substep %.3f m", 2.0f * m_plateHalfThickness,
+					  m_speed * substepTime );
+	}
+
+	static Sample* Create( SampleContext* context )
+	{
+		return new BulletThinPlate( context );
+	}
+
+	b3MeshData* m_mesh;
+	b3BodyId m_bulletIds[2];
+	int m_shotCount[2];
+	int m_crossCount[2];
+	bool m_crossed[2];
+	int m_stepsSinceFire = 0;
+	float m_firedRadius = 0.01f;
+	float m_radius = 0.01f;
+	float m_speed = 300.0f;
+	float m_lateralSpeed = 30.0f;
+	bool m_autoFire = true;
+};
+
+static int sampleBulletThinPlate = RegisterSample( "Issues", "Bullet Thin Plate", BulletThinPlate::Create );
+
+// This isse
+class BollardTwistSpring : public Sample
+{
+public:
+	enum
+	{
+		e_maxBollards = 40
+	};
+
+	struct Bollard
+	{
+		b3BodyId bodyId;
+		b3JointId jointId;
+		b3Pos pivot;
+		float twistDegrees;
+	};
+
+	explicit BollardTwistSpring( SampleContext* context )
+		: Sample( context )
+	{
+		m_count = b3ClampInt( s_count, 2, e_maxBollards );
+		m_firstX = -0.5f * m_spacing * ( m_count - 1 );
+		m_lastX = m_firstX + m_spacing * ( m_count - 1 );
+
+		if ( context->restart == false )
+		{
+			m_camera->SetView( 20.0f, 20.0f, 0.9f * m_spacing * m_count + 10.0f, { 0.0f, 0.5f, 0.0f } );
+		}
+
+		// AddGroundBox( 0.5f * m_spacing * m_count + 12.0f );
+
+		b3BodyDef anchorDef = b3DefaultBodyDef();
+		b3BodyId anchorId = b3CreateBody( m_worldId, &anchorDef );
+
+		// The joint frame z-axis is the bollard's longitudinal axis. Rotate frame A so that z is world up.
+		// The spring target rotation is identity, which means the bollard stands upright.
+		m_frameQ = b3MakeQuatFromAxisAngle( b3Vec3_axisX, -0.5f * B3_PI );
+
+		// Capsule along the body z-axis, starting at the pivot.
+		b3Capsule capsule = { { 0.0f, 0.0f, 0.0f }, { 0.0f, 0.0f, 0.9f }, 0.15f };
+		b3ShapeDef shapeDef = b3DefaultShapeDef();
+		shapeDef.baseMaterial.friction = 0.5f;
+
+		for ( int i = 0; i < 1; ++i )
+		{
+			Bollard& bollard = m_bollards[i];
+			bollard.pivot = { m_firstX + i * m_spacing, 0.15f, 0.0f };
+
+			// 180 degrees at the first bollard down to 0 at the last. The spherical joint twist limit tops out at
+			// 0.99 pi, so the pinned twist is capped just below 180.
+			float twist = 180.0f * ( 1.0f - (float)10 / (float)( m_count - 1 ) );
+			bollard.twistDegrees = b3MinFloat( twist, 176.0f );
+
+			// twist about the bollard's own axis, applied in the body frame
+			b3Quat twistQ = b3MakeQuatFromAxisAngle( b3Vec3_axisZ, B3_DEG_TO_RAD * bollard.twistDegrees );
+
+			b3BodyDef bodyDef = b3DefaultBodyDef();
+			bodyDef.type = b3_dynamicBody;
+			bodyDef.name = "bollard";
+			bodyDef.position = bollard.pivot;
+			bodyDef.rotation = b3MulQuat( m_frameQ, twistQ );
+			bollard.bodyId = b3CreateBody( m_worldId, &bodyDef );
+			b3CreateCapsuleShape( bollard.bodyId, &shapeDef, &capsule );
+
+			b3Vec3 p = { (float)bollard.pivot.x, (float)bollard.pivot.y, (float)bollard.pivot.z };
+
+#if 0
+			b3WeldJointDef jointDef = b3DefaultWeldJointDef();
+			jointDef.base.bodyIdA = anchorId;
+			jointDef.base.bodyIdB = bollard.bodyId;
+			jointDef.base.localFrameA.p = p;
+			jointDef.base.localFrameA.q = m_frameQ;
+			jointDef.base.drawScale = 0.3f;
+			jointDef.angularHertz = s_hertz;
+			jointDef.angularDampingRatio = s_dampingRatio;
+			bollard.jointId = b3CreateWeldJoint( m_worldId, &jointDef );
+#else
+			b3SphericalJointDef jointDef = b3DefaultSphericalJointDef();
+			jointDef.base.bodyIdA = anchorId;
+			jointDef.base.bodyIdB = bollard.bodyId;
+			jointDef.base.localFrameA.p = p;
+			jointDef.base.localFrameA.q = m_frameQ;
+			jointDef.base.drawScale = 0.3f;
+			jointDef.enableSpring = true;
+			jointDef.hertz = s_hertz;
+			jointDef.dampingRatio = s_dampingRatio;
+			jointDef.targetRotation = b3Quat_identity;
+			jointDef.enableTwistLimit = true;
+			jointDef.lowerTwistAngle = B3_DEG_TO_RAD * ( bollard.twistDegrees - 1.0f );
+			jointDef.upperTwistAngle = B3_DEG_TO_RAD * ( bollard.twistDegrees + 1.0f );
+			jointDef.lowerTwistAngle = -B3_DEG_TO_RAD * ( bollard.twistDegrees );
+			jointDef.upperTwistAngle = B3_DEG_TO_RAD * ( bollard.twistDegrees );
+			//jointDef.lowerTwistAngle = -0.5f * B3_PI;
+			//jointDef.upperTwistAngle = 0.5f * B3_PI;
+			bollard.jointId = b3CreateSphericalJoint( m_worldId, &jointDef );
+
+			// A narrow limit window around the initial twist pins the twist
+			//b3SphericalJoint_SetTwistLimits( bollard.jointId, B3_DEG_TO_RAD * ( bollard.twistDegrees - 1.0f ),
+			//								 B3_DEG_TO_RAD * ( bollard.twistDegrees + 1.0f ) );
+#endif
+		}
+
+		//CreateCar( m_firstX - 5.0f );
+	}
+
+	// A box on four driven wheels. The chassis rides high enough that a bollard pushed flat fits under it.
+	void CreateCar( float x0 )
+	{
+		const float wheelRadius = 0.55f;
+		const float wheelWidth = 0.2f;
+		const float chassisHeight = 0.35f;
+
+		b3ShapeDef shapeDef = b3DefaultShapeDef();
+		shapeDef.baseMaterial.friction = 0.8f;
+
+		b3BodyDef bodyDef = b3DefaultBodyDef();
+		bodyDef.type = b3_dynamicBody;
+		bodyDef.name = "chassis";
+		bodyDef.position = { x0, wheelRadius + chassisHeight, 0.0f };
+		m_carId = b3CreateBody( m_worldId, &bodyDef );
+
+		b3BoxHull box = b3MakeBoxHull( 0.8f, 0.25f, 0.5f );
+		b3CreateHullShape( m_carId, &shapeDef, &box.base );
+
+		// b3CreateCylinder builds along the y-axis, so each wheel is rotated to put that axis along world z.
+		// The revolute joint spins about the z-axis of its frames.
+		b3HullData* wheelHull = b3CreateCylinder( wheelWidth, wheelRadius, -0.5f * wheelWidth, 16 );
+		b3Quat wheelQ = b3ComputeQuatBetweenUnitVectors( b3Vec3_axisY, b3Vec3_axisZ );
+		b3Quat jointQ = b3ComputeQuatBetweenUnitVectors( b3Vec3_axisZ, b3Vec3_axisY );
+
+		for ( int i = 0; i < 4; ++i )
+		{
+			float dx = i < 2 ? 0.6f : -0.6f;
+			float dz = ( i % 2 == 0 ) ? 0.62f : -0.62f;
+
+			b3BodyDef wheelDef = b3DefaultBodyDef();
+			wheelDef.type = b3_dynamicBody;
+			wheelDef.name = "wheel";
+			wheelDef.position = { x0 + dx, wheelRadius, dz };
+			wheelDef.rotation = wheelQ;
+			b3BodyId wheelId = b3CreateBody( m_worldId, &wheelDef );
+			b3CreateHullShape( wheelId, &shapeDef, wheelHull );
+
+			b3RevoluteJointDef jointDef = b3DefaultRevoluteJointDef();
+			jointDef.base.bodyIdA = m_carId;
+			jointDef.base.bodyIdB = wheelId;
+			jointDef.base.localFrameA.p = { dx, -chassisHeight, dz };
+			jointDef.base.localFrameB.q = jointQ;
+			jointDef.base.drawScale = 0.4f;
+			jointDef.enableMotor = true;
+			jointDef.maxMotorTorque = 600.0f;
+			jointDef.motorSpeed = -s_driveSpeed / wheelRadius;
+			m_wheelJointIds[i] = b3CreateRevoluteJoint( m_worldId, &jointDef );
+		}
+
+		b3DestroyHull( wheelHull );
+	}
+
+#if 0
+	// Stop the car after it has passed the last bollard so it does not drive off the ground.
+	void Step() override
+	{
+		Sample::Step();
+
+		if ( b3Body_GetPosition( m_carId ).x > m_lastX + 3.0f )
+		{
+			for ( int i = 0; i < 4; ++i )
+			{
+				b3RevoluteJoint_SetMotorSpeed( m_wheelJointIds[i], 0.0f );
+			}
+		}
+	}
+
+	bool DrawControls() override
+	{
+		ImGui::SliderInt( "Bollards", &s_count, 2, e_maxBollards );
+		ImGui::SliderFloat( "Car speed", &s_driveSpeed, 1.0f, 8.0f, "%.1f m/s" );
+		ImGui::SliderFloat( "Hertz", &s_hertz, 0.5f, 10.0f, "%.1f" );
+		ImGui::SliderFloat( "Damping", &s_dampingRatio, 0.0f, 2.0f, "%.1f" );
+		DrawTextLine( "Press R to restart with these settings." );
+		return true;
+	}
+#endif
+
+#if 0
+	void Render() override
+	{
+		DrawTextLine( "A car drives over bollards on sprung spherical joints. Spring target: upright." );
+		DrawTextLine( "Bollard twist is pinned from 180 degrees (first) down to 0 (last)." );
+		DrawTextLine( "Expected: every bollard springs back up. Actual: the more twist, the less it recovers." );
+
+		for ( int i = 0; i < m_count; ++i )
+		{
+			const Bollard& bollard = m_bollards[i];
+
+			b3Quat q = b3Body_GetRotation( bollard.bodyId );
+
+			// tilt is the angle between the bollard axis and world up
+			b3Vec3 axis = b3RotateVector( q, b3Vec3_axisZ );
+			float tilt = B3_RAD_TO_DEG * acosf( b3ClampFloat( axis.y, -1.0f, 1.0f ) );
+			b3HexColor color = tilt < 5.0f ? b3_colorLimeGreen : b3_colorOrangeRed;
+
+			b3Pos top = { bollard.pivot.x, bollard.pivot.y + 1.2f, bollard.pivot.z };
+			DrawArrow( bollard.pivot, top, MakeColor( b3_colorLightGreen ) );
+
+			b3Pos labelPoint = { bollard.pivot.x, bollard.pivot.y + 1.6f, bollard.pivot.z };
+			DrawString3D( labelPoint, MakeColor( color ), "twist %.0f", bollard.twistDegrees );
+			labelPoint.y -= 0.25f;
+			DrawString3D( labelPoint, MakeColor( color ), "tilt %.0f", tilt );
+		}
+	}
+#endif
+
+	static Sample* Create( SampleContext* context )
+	{
+		return new BollardTwistSpring( context );
+	}
+
+	Bollard m_bollards[e_maxBollards];
+	b3BodyId m_carId;
+	b3JointId m_wheelJointIds[4];
+	b3Quat m_frameQ;
+	int m_count;
+	float m_firstX;
+	float m_lastX;
+	float m_spacing = 1.8f;
+
+	// kept across restarts so the sliders take effect when the sample is restarted
+	static inline int s_count = 19;
+	static inline float s_driveSpeed = 3.0f;
+	static inline float s_hertz = 1.5f;
+	static inline float s_dampingRatio = 0.3f;
+};
+
+static int sampleBollardTwistSpring = RegisterSample( "Issues", "Bollard Twist Spring", BollardTwistSpring::Create );

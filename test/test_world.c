@@ -6,6 +6,7 @@
 #include "dynamic_tree.h"
 #include "overflow_color.h"
 #include "physics_world.h"
+#include "platform.h"
 #include "recording.h"
 #include "test_macros.h"
 
@@ -843,6 +844,54 @@ static int TestOverflowColorPile( void )
 	return 0;
 }
 
+// s&box report: more than UINT16_MAX overflow contacts tripped an assert in the overflow
+// prepare and truncated the block count in the other overflow stages. Every contact joins
+// the same two bodies, so all but one land in the overflow color. Two bodies keep it fast in Debug.
+static int TestOverflowColorLarge( void )
+{
+	b3WorldDef worldDef = b3DefaultWorldDef();
+	worldDef.gravity = b3Vec3_zero;
+	worldDef.workerCount = 1;
+	b3WorldId worldId = b3CreateWorld( &worldDef );
+
+	int side = 260;
+	float spacing = 1.5f;
+	float extent = 0.5f * spacing * side;
+
+	b3BodyDef bodyDef = b3DefaultBodyDef();
+	bodyDef.type = b3_dynamicBody;
+	b3BodyId slabId = b3CreateBody( worldId, &bodyDef );
+	b3ShapeDef shapeDef = b3DefaultShapeDef();
+	b3BoxHull slab = b3MakeBoxHull( extent, 0.5f, extent );
+	b3CreateHullShape( slabId, &shapeDef, &slab.base );
+
+	bodyDef.position = (b3Pos){ 0.0f, 0.99f, 0.0f };
+	b3BodyId bedId = b3CreateBody( worldId, &bodyDef );
+	shapeDef.updateBodyMass = false;
+	for ( int i = 0; i < side; ++i )
+	{
+		for ( int j = 0; j < side; ++j )
+		{
+			b3Sphere sphere = { { -extent + spacing * ( i + 0.5f ), 0.0f, -extent + spacing * ( j + 0.5f ) }, 0.5f };
+			b3CreateSphereShape( bedId, &shapeDef, &sphere );
+		}
+	}
+	b3Body_ApplyMassFromShapes( bedId );
+
+	for ( int i = 0; i < 2; ++i )
+	{
+		b3World_Step( worldId, 1.0f / 60.0f, 4 );
+	}
+
+	b3Counters counters = b3World_GetCounters( worldId );
+	int overflowContacts = counters.colorCounts[B3_GRAPH_COLOR_COUNT - 1];
+
+	b3DestroyWorld( worldId );
+
+	ENSURE( overflowContacts > UINT16_MAX );
+	return 0;
+}
+
 // Exposes that b3Body_EnableSleep mutates body->flags but never syncs
 // bodySim->flags / bodyState->flags. When a body created with
 // enableSleep=false is later flipped on, body->flags gains b3_enableSleep
@@ -874,15 +923,15 @@ static int EnableSleepFlagSyncTest( void )
 
 // Exposes that b3Body_SetBullet writes only bodySim->flags without
 // touching body->flags, while b3SyncBodyFlags overwrites bodySim from
-// body->flags. Any subsequent b3Body_SetMotionLocks or b3Body_SetType
+// body->flags. Any subsequent b3Body_SetFixedRotation or b3Body_SetType
 // silently wipes (or re-asserts) the bullet bit.
 //
 // Reproducer A: create with isBullet=false, SetBullet(true), then
-// SetMotionLocks. b3Body_IsBullet returns false today (wiped); should be
+// SetFixedRotation. b3Body_IsBullet returns false today (wiped); should be
 // true after fix.
 //
 // Reproducer B: create with isBullet=true, SetBullet(false), then
-// SetMotionLocks. b3Body_IsBullet returns true today (re-asserted); should
+// SetFixedRotation. b3Body_IsBullet returns true today (re-asserted); should
 // be false after fix.
 static int SetBulletDriftTest( void )
 {
@@ -900,9 +949,7 @@ static int SetBulletDriftTest( void )
 		b3Body_SetBullet( bodyId, true );
 		ENSURE( b3Body_IsBullet( bodyId ) == true );
 
-		b3MotionLocks locks = { 0 };
-		locks.linearX = true;
-		b3Body_SetMotionLocks( bodyId, locks );
+		b3Body_SetFixedRotation( bodyId, true );
 
 		ENSURE( b3Body_IsBullet( bodyId ) == true );
 	}
@@ -918,9 +965,7 @@ static int SetBulletDriftTest( void )
 		b3Body_SetBullet( bodyId, false );
 		ENSURE( b3Body_IsBullet( bodyId ) == false );
 
-		b3MotionLocks locks = { 0 };
-		locks.linearX = true;
-		b3Body_SetMotionLocks( bodyId, locks );
+		b3Body_SetFixedRotation( bodyId, true );
 
 		ENSURE( b3Body_IsBullet( bodyId ) == false );
 	}
@@ -1759,11 +1804,9 @@ static int LocatorFastFlagTest( void )
 	b3BodySim* sim = b3GetBodySim( world, body );
 	ENSURE( ( sim->flags & b3_isFast ) != 0 );
 
-	// Any public setter that syncs flags. The locks have to actually change or the setter
+	// Any public setter that syncs flags. The flag has to actually change or the setter
 	// returns early and never syncs.
-	b3MotionLocks locks = { 0 };
-	locks.angularX = true;
-	b3Body_SetMotionLocks( bulletId, locks );
+	b3Body_SetFixedRotation( bulletId, true );
 
 	sim = b3GetBodySim( world, b3GetBodyFullId( world, bulletId ) );
 	ENSURE( ( sim->flags & b3_isFast ) != 0 );
@@ -1797,6 +1840,226 @@ static int BodySimLocatorTest( void )
 	return LocatorFastFlagTest();
 }
 
+// A query thread runs static overlaps while the main thread steps. A static body is added before
+// each step so the step clears moved flags in the static tree under the reader. Run under TSan
+// to check the relaxed flag access.
+typedef struct StaticQueryShared
+{
+	b3WorldId worldId;
+	b3AtomicInt stepping;
+	b3AtomicInt quit;
+	b3AtomicInt idle;
+	b3AtomicInt started;
+	b3AtomicInt expectedCount;
+	b3AtomicInt queryCount;
+	b3AtomicInt failCount;
+} StaticQueryShared;
+
+typedef struct StaticQueryHits
+{
+	b3WorldId worldId;
+	int count;
+	bool nonStatic;
+} StaticQueryHits;
+
+static bool StaticQueryFcn( b3ShapeId shapeId, void* context )
+{
+	StaticQueryHits* hits = context;
+	b3BodyId bodyId = b3Shape_GetBody( shapeId );
+	hits->count += 1;
+
+	// Body type is read through the body array, which the step mutates for awake bodies. Static
+	// bodies are not touched by the step.
+	if ( b3Body_GetType( bodyId ) != b3_staticBody )
+	{
+		hits->nonStatic = true;
+	}
+	return true;
+}
+
+typedef struct StaticCastHit
+{
+	int count;
+	float fraction;
+	bool nonStatic;
+} StaticCastHit;
+
+static float StaticCastFcn( b3ShapeId shapeId, b3Pos point, b3Vec3 normal, float fraction, uint64_t userMaterialId,
+							int triangleIndex, int childIndex, void* context )
+{
+	B3_UNUSED( point, normal, userMaterialId, triangleIndex, childIndex );
+
+	StaticCastHit* hit = context;
+	hit->count += 1;
+	hit->fraction = fraction;
+	if ( b3Body_GetType( b3Shape_GetBody( shapeId ) ) != b3_staticBody )
+	{
+		hit->nonStatic = true;
+	}
+	return fraction;
+}
+
+static bool CheckStaticQueries( b3WorldId worldId, int expectedCount )
+{
+	b3QueryFilter filter = b3DefaultQueryFilter();
+
+	b3Vec3 corners[8];
+	for ( int i = 0; i < 8; ++i )
+	{
+		corners[i] = (b3Vec3){ ( i & 1 ) ? 100.0f : -100.0f, ( i & 2 ) ? 10.0f : -10.0f, ( i & 4 ) ? 100.0f : -100.0f };
+	}
+	b3ShapeProxy boxProxy = { corners, 8, 0.0f };
+
+	StaticQueryHits hits = { worldId, 0, false };
+	b3World_OverlapShape_Static( worldId, b3Pos_zero, &boxProxy, filter, StaticQueryFcn, &hits );
+	if ( hits.count != expectedCount || hits.nonStatic )
+	{
+		return false;
+	}
+
+	// Straight down through the column of a dynamic cube, so only the static tile can answer
+	b3Pos origin = { 0.5f, 5.0f, -9.5f };
+	b3Vec3 translation = { 0.0f, -10.0f, 0.0f };
+
+	StaticCastHit rayHit = { 0, 1.0f, false };
+	b3World_CastRay_Static( worldId, origin, translation, filter, StaticCastFcn, &rayHit );
+	if ( rayHit.count == 0 || rayHit.nonStatic || b3AbsFloat( rayHit.fraction - 0.5f ) > 0.001f )
+	{
+		return false;
+	}
+
+	b3Vec3 center = b3Vec3_zero;
+	b3ShapeProxy sphereProxy = { &center, 1, 0.25f };
+	StaticCastHit shapeHit = { 0, 1.0f, false };
+	b3World_CastShape_Static( worldId, origin, &sphereProxy, translation, filter, StaticCastFcn, &shapeHit );
+	if ( shapeHit.count == 0 || shapeHit.nonStatic || b3AbsFloat( shapeHit.fraction - 0.475f ) > 0.001f )
+	{
+		return false;
+	}
+
+	return true;
+}
+
+static void StaticQueryThread( void* context )
+{
+	StaticQueryShared* shared = context;
+	b3AABB box = { { -100.0f, -10.0f, -100.0f }, { 100.0f, 10.0f, 100.0f } };
+	b3QueryFilter filter = b3DefaultQueryFilter();
+
+	while ( b3AtomicLoadInt( &shared->quit ) == 0 )
+	{
+		if ( b3AtomicLoadInt( &shared->stepping ) == 0 )
+		{
+			b3AtomicStoreInt( &shared->idle, 1 );
+			b3Yield();
+			continue;
+		}
+
+		b3AtomicStoreInt( &shared->idle, 0 );
+		b3AtomicStoreInt( &shared->started, 1 );
+		int expected = b3AtomicLoadInt( &shared->expectedCount );
+
+		StaticQueryHits hits = { shared->worldId, 0, false };
+		b3World_OverlapAABB_Static( shared->worldId, box, filter, StaticQueryFcn, &hits );
+		bool castsPassed = CheckStaticQueries( shared->worldId, expected );
+		b3AtomicFetchAddInt( &shared->queryCount, 1 );
+
+		if ( hits.count != expected || hits.nonStatic || castsPassed == false )
+		{
+			b3AtomicFetchAddInt( &shared->failCount, 1 );
+		}
+	}
+}
+
+static int TestOverlapStaticDuringStep( void )
+{
+	b3WorldDef worldDef = b3DefaultWorldDef();
+	worldDef.workerCount = 4;
+	b3WorldId worldId = b3CreateWorld( &worldDef );
+
+	b3ShapeDef shapeDef = b3DefaultShapeDef();
+	b3BoxHull tile = b3MakeBoxHull( 1.0f, 0.5f, 1.0f );
+	int staticCount = 0;
+
+	for ( int i = -10; i < 10; ++i )
+	{
+		for ( int j = -10; j < 10; ++j )
+		{
+			b3BodyDef bodyDef = b3DefaultBodyDef();
+			bodyDef.position = (b3Pos){ 2.0f * i + 1.0f, -0.5f, 2.0f * j + 1.0f };
+			b3BodyId bodyId = b3CreateBody( worldId, &bodyDef );
+			b3CreateHullShape( bodyId, &shapeDef, &tile.base );
+			staticCount += 1;
+		}
+	}
+
+	b3BoxHull cube = b3MakeBoxHull( 0.4f, 0.4f, 0.4f );
+	for ( int i = 0; i < 400; ++i )
+	{
+		b3BodyDef bodyDef = b3DefaultBodyDef();
+		bodyDef.type = b3_dynamicBody;
+		bodyDef.position = (b3Pos){ -9.5f + ( i % 20 ), 1.0f + 0.9f * ( i / 100 ), -9.5f + ( ( i / 20 ) % 5 ) * 4.0f };
+		b3BodyId bodyId = b3CreateBody( worldId, &bodyDef );
+		b3CreateHullShape( bodyId, &shapeDef, &cube.base );
+	}
+
+	StaticQueryShared shared = { 0 };
+	shared.worldId = worldId;
+	b3Thread* thread = b3CreateThread( StaticQueryThread, &shared, "static query" );
+
+	b3BoxHull post = b3MakeBoxHull( 0.1f, 1.0f, 0.1f );
+	for ( int step = 0; step < 120; ++step )
+	{
+		// The query thread is idle, so the static tree may change.
+		b3BodyDef bodyDef = b3DefaultBodyDef();
+		bodyDef.position = (b3Pos){ -50.0f + step, 1.0f, 50.0f };
+		b3BodyId bodyId = b3CreateBody( worldId, &bodyDef );
+		b3CreateHullShape( bodyId, &shapeDef, &post.base );
+		staticCount += 1;
+
+		ENSURE( b3HasTreeMoved( b3GetWorldFromId( worldId )->broadPhase.trees + b3_staticBody ) );
+
+		b3AtomicStoreInt( &shared.expectedCount, staticCount );
+		b3AtomicStoreInt( &shared.started, 0 );
+		b3AtomicStoreInt( &shared.stepping, 1 );
+
+		// Scheduling decides how many rounds land inside the step, so only wait for one to begin
+		while ( b3AtomicLoadInt( &shared.started ) == 0 )
+		{
+			b3Yield();
+		}
+
+		b3World_Step( worldId, 1.0f / 60.0f, 4 );
+
+		b3AtomicStoreInt( &shared.stepping, 0 );
+		b3AtomicStoreInt( &shared.idle, 0 );
+		while ( b3AtomicLoadInt( &shared.idle ) == 0 )
+		{
+			b3Yield();
+		}
+
+		ENSURE( b3HasTreeMoved( b3GetWorldFromId( worldId )->broadPhase.trees + b3_staticBody ) == false );
+	}
+
+	b3AtomicStoreInt( &shared.quit, 1 );
+	b3JoinThread( thread );
+
+	// Each step started a round, and the thread cannot report idle until that round finishes
+	ENSURE( b3AtomicLoadInt( &shared.queryCount ) >= 120 );
+	ENSURE( b3AtomicLoadInt( &shared.failCount ) == 0 );
+
+	// The serial path agrees with the regular overlap filtered to static bodies.
+	StaticQueryHits hits = { worldId, 0, false };
+	b3AABB box = { { -100.0f, -10.0f, -100.0f }, { 100.0f, 10.0f, 100.0f } };
+	b3World_OverlapAABB_Static( worldId, box, b3DefaultQueryFilter(), StaticQueryFcn, &hits );
+	ENSURE( hits.count == staticCount );
+	ENSURE( hits.nonStatic == false );
+	ENSURE( CheckStaticQueries( worldId, staticCount ) );
+
+	b3DestroyWorld( worldId );
+	return 0;
+}
+
 int WorldTest( void )
 {
 	RUN_SUBTEST( HelloWorld );
@@ -1813,6 +2076,7 @@ int WorldTest( void )
 	RUN_SUBTEST( TestCompoundHitEvents );
 	RUN_SUBTEST( TestCompoundContactMaterials );
 	RUN_SUBTEST( TestOverflowColorPile );
+	RUN_SUBTEST( TestOverflowColorLarge );
 	RUN_SUBTEST( SetBulletDriftTest );
 	RUN_SUBTEST( EnableSleepFlagSyncTest );
 	RUN_SUBTEST( EnableSleepNoopUnlockTest );
@@ -1825,6 +2089,7 @@ int WorldTest( void )
 	RUN_SUBTEST( TestEnlargedProxyDestroyed );
 	RUN_SUBTEST( TestCompoundShapeCount );
 	RUN_SUBTEST( BodySimLocatorTest );
+	RUN_SUBTEST( TestOverlapStaticDuringStep );
 
 	return 0;
 }

@@ -5,14 +5,22 @@ set(BOX3D_SHARED_FILES
 	benchmarks.h
 	determinism.c
 	determinism.h
+	ghost_collisions.c
+	ghost_collisions.h
+	ghost_oracle.c
+	ghost_oracle.h
 	human.c
 	human.h
+	mesh_drop.c
+	mesh_drop.h
 	overflow_color.c
 	overflow_color.h
 	stability.c
 	stability.h
 	utils.c
 	utils.h
+	wagon.c
+	wagon.h
 )
 
 add_library(shared STATIC ${BOX3D_SHARED_FILES})
